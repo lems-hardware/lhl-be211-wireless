@@ -45,7 +45,14 @@ if (bundle / "Contents/Info.plist").read_bytes() != (baseline / "Contents/Info.p
 plist = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
 if plist["CFBundleExecutable"] != binary.name:
     raise SystemExit("Incorrect executable metadata")
-if run("llvm-nm", "-u", str(binary)) != run("llvm-nm", "-u", str(baseline / "Contents/MacOS/AirportItlwm")):
+def imports(path):
+    return {line.split()[-1] for line in run("llvm-nm", "-u", str(path)).splitlines() if line.strip()}
+
+expected_imports = imports(baseline / "Contents/MacOS/AirportItlwm")
+actual_imports = imports(binary)
+if actual_imports != expected_imports:
+    print("Added imports:", sorted(actual_imports - expected_imports), flush=True)
+    print("Removed imports:", sorted(expected_imports - actual_imports), flush=True)
     raise SystemExit("Undefined imports differ from the tested preview")
 for marker in (b"_BE211_OPEN_NETWORKS_1", b"duration=until-disconnect", b"BSD TX ring tx="):
     if marker not in data:
