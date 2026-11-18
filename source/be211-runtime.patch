@@ -1,0 +1,3459 @@
+diff --git a/AirportItlwm/AirportItlwmSkywalkInterface.cpp b/AirportItlwm/AirportItlwmSkywalkInterface.cpp
+index d2b11a4..610099f 100644
+--- a/AirportItlwm/AirportItlwmSkywalkInterface.cpp
++++ b/AirportItlwm/AirportItlwmSkywalkInterface.cpp
+@@ -314,6 +314,16 @@ init(IOService *provider)
+ IOReturn AirportItlwmSkywalkInterface::
+ getSSID(struct apple80211_ssid_data *sd)
+ {
++#ifdef AIRPORT_WCL
++    AirportWCL::BeaconMetadata bss = {};
++    if (copyBE211CurrentBss(bss)) {
++        *sd = {};
++        sd->version = APPLE80211_VERSION;
++        sd->ssid_len = MIN(bss.ssidLength, sizeof(sd->ssid_bytes));
++        memcpy(sd->ssid_bytes, bss.ssid, sd->ssid_len);
++        return kIOReturnSuccess;
++    }
++#endif
+     struct ieee80211com * ic = fHalService->get80211Controller();
+     if (ic->ic_state == IEEE80211_S_RUN) {
+         memset(sd, 0, sizeof(*sd));
+@@ -478,6 +488,18 @@ IOReturn AirportItlwmSkywalkInterface::
+ getCHANNEL(struct apple80211_channel_data *cd)
+ {
+     struct ieee80211com * ic = fHalService->get80211Controller();
++#ifdef AIRPORT_WCL
++    AirportWCL::BeaconMetadata bss = {};
++    if (copyBE211CurrentBss(bss) && bss.channel >= 1 && bss.channel <= 11) {
++        *cd = {};
++        cd->version = APPLE80211_VERSION;
++        cd->channel.version = APPLE80211_VERSION;
++        cd->channel.channel = bss.channel;
++        cd->channel.flags = ieeeChanFlag2apple(ic->ic_channels[bss.channel].ic_flags,
++                                              IEEE80211_CHAN_WIDTH_20);
++        return kIOReturnSuccess;
++    }
++#endif
+     /* Same rule as the scan list: no channel means no channel to report. */
+     const struct ieee80211_node *ni = ieee80211_mld_active_node(ic);
+     const struct ieee80211_channel *chan = ni != NULL ? ni->ni_chan : NULL;
+@@ -499,6 +521,11 @@ getSTATE(struct apple80211_state_data *sd)
+     memset(sd, 0, sizeof(*sd));
+     sd->version = APPLE80211_VERSION;
+     sd->state = fHalService->get80211Controller()->ic_state;
++#ifdef AIRPORT_WCL
++    AirportWCL::BeaconMetadata bss = {};
++    if (copyBE211CurrentBss(bss))
++        sd->state = IEEE80211_S_RUN;
++#endif
+     return kIOReturnSuccess;
+ }
+ 
+@@ -672,6 +699,15 @@ getRATE(struct apple80211_rate_data *rd)
+ IOReturn AirportItlwmSkywalkInterface::
+ getBSSID(struct apple80211_bssid_data *bd)
+ {
++#ifdef AIRPORT_WCL
++    AirportWCL::BeaconMetadata bss = {};
++    if (copyBE211CurrentBss(bss)) {
++        *bd = {};
++        bd->version = APPLE80211_VERSION;
++        IEEE80211_ADDR_COPY(bd->bssid.octet, bss.bssid);
++        return kIOReturnSuccess;
++    }
++#endif
+     struct ieee80211com *ic = fHalService->get80211Controller();
+     if (ic->ic_state == IEEE80211_S_RUN) {
+         memset(bd, 0, sizeof(*bd));
+@@ -793,6 +829,19 @@ getNSS(struct apple80211_nss_data *data)
+ IOReturn AirportItlwmSkywalkInterface::
+ setASSOCIATE(struct apple80211_assoc_data *ad)
+ {
++#ifdef AIRPORT_WCL
++    auto iwx = OSDynamicCast(ItlIwx, fHalService);
++    if (iwx && iwx->isBE211ScanOnly()) {
++        if (!ad || !instance->power_state)
++            return kIOReturnNotReady;
++        if (ad->ad_mode == APPLE80211_AP_MODE_IBSS || ad->ad_auth_lower != 1 ||
++            ad->ad_auth_upper || ad->ad_key.key_len || ad->ad_rsn_ie_len)
++            return kIOReturnUnsupported;
++        const int err = iwx->probeBE211Join(ad->ad_ssid, ad->ad_ssid_len, ad->ad_bssid.octet);
++        IOLog("BE211 probe: legacy join diagnostic result=%d\n", err);
++        return err == EBUSY ? kIOReturnBusy : kIOReturnUnsupported;
++    }
++#endif
+     XYLog("%s [%s] mode=%d ad_auth_lower=%d ad_auth_upper=%d rsn_ie_len=%d%s%s%s%s%s%s%s\n", __FUNCTION__, ad->ad_ssid, ad->ad_mode, ad->ad_auth_lower, ad->ad_auth_upper, ad->ad_rsn_ie_len,
+           (ad->ad_flags & 2) ? ", Instant Hotspot" : "",
+           (ad->ad_flags & 4) ? ", Auto Instant Hotspot" : "",
+@@ -834,6 +883,13 @@ setASSOCIATE(struct apple80211_assoc_data *ad)
+ IOReturn AirportItlwmSkywalkInterface::
+ setDISASSOCIATE(struct apple80211_disassoc_data *ad)
+ {
++#ifdef AIRPORT_WCL
++    auto iwx = OSDynamicCast(ItlIwx, fHalService);
++    if (iwx && iwx->isBE211ScanOnly()) {
++        iwx->cancelBE211Join("legacy disassociate");
++        return kIOReturnSuccess;
++    }
++#endif
+     XYLog("%s\n", __FUNCTION__);
+     struct ieee80211com *ic = fHalService->get80211Controller();
+ 
+diff --git a/AirportItlwm/AirportItlwmSkywalkInterface.hpp b/AirportItlwm/AirportItlwmSkywalkInterface.hpp
+index 1a5330d..cec9f2e 100644
+--- a/AirportItlwm/AirportItlwmSkywalkInterface.hpp
++++ b/AirportItlwm/AirportItlwmSkywalkInterface.hpp
+@@ -16,6 +16,7 @@
+ #include <Airport/Apple80211.h>
+ #include <sys/kernel_types.h>
+ struct ieee80211com;
++struct ieee80211_beacon_event;
+ 
+ #ifdef AIRPORT_WCL
+ #define AIRPORT_SKYWALK_OVERRIDE
+@@ -431,6 +432,14 @@ public:
+ private:
+     static IOReturn wclCommand(OSObject *, void *, void *, void *, void *);
+     struct CountryUpdate;
++    struct BE211JoinWork;
++    static void be211JoinThread(void *, void *);
++    static IOReturn be211JoinGated(OSObject *, void *, void *, void *, void *);
++    static bool publishBE211Association(void *, const ieee80211_beacon_event &);
++    IOReturn queueBE211Join(const AirportWCL::JoinRequest &);
++    bool copyBE211CurrentBss(AirportWCL::BeaconMetadata &);
++    BE211JoinWork *be211JoinWork = nullptr;
++    bool be211JoinCancelled = false;
+     static void wclCountryUpdateThread(void *, void *);
+     static IOReturn wclCountryUpdateGated(OSObject *, void *, void *, void *, void *);
+     static IOReturn stopWCLGated(OSObject *, void *, void *, void *, void *);
+@@ -454,7 +463,7 @@ private:
+     IOReturn startWCLJoin(AirportWCL::JoinRequest &);
+     void resumeWCLJoin();
+     IOReturn abortWCLJoin();
+-    IOReturn leaveWCLNetwork();
++    IOReturn leaveWCLNetwork(const char *source);
+     void finishWCLScan(IOReturn);
+     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
+     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
+diff --git a/AirportItlwm/AirportItlwmV2.cpp b/AirportItlwm/AirportItlwmV2.cpp
+index bfddce7..f3142cc 100644
+--- a/AirportItlwm/AirportItlwmV2.cpp
++++ b/AirportItlwm/AirportItlwmV2.cpp
+@@ -470,6 +470,8 @@ bool AirportItlwm::start(IOService *provider)
+     bsdInterface->registerService();
+ #endif
+     registerService();
++    if (pciNub->getProperty("AirportItlwm-BE211Probe"))
++        IOLog("BE211 probe: Skywalk and BSD interface registration submitted\n");
+     return true;
+ }
+ 
+@@ -649,6 +651,13 @@ setLinkStatus(UInt32 status, const IONetworkMedium * activeMedium, UInt64 speed,
+         return true;
+     }
+     bool ret = super::setLinkStatus(status, activeMedium, speed, data);
++#ifdef AIRPORT_WCL
++    auto iwx = OSDynamicCast(ItlIwx, fHalService);
++    if (iwx && iwx->isBE211ScanOnly() && iwx->be211ScanBusy())
++        IOLog("BE211 probe: BSD link publication status=0x%x active=%u controller_result=%u\n",
++              status, static_cast<unsigned>((status & kIONetworkLinkActive) != 0),
++              static_cast<unsigned>(ret));
++#endif
+     currentStatus = status;
+     if (fNetIf) {
+         if (status & kIONetworkLinkActive) {
+@@ -767,7 +776,8 @@ UInt32 AirportItlwm::enqueuePacket(mbuf_t m)
+ {
+     auto ic = fHalService->get80211Controller();
+     auto ifp = &ic->ic_ac.ac_if;
+-    if (ic->ic_state == IEEE80211_S_RUN && ifp->if_snd.queue &&
++    auto iwx = OSDynamicCast(ItlIwx, fHalService);
++    if ((ic->ic_state == IEEE80211_S_RUN || (iwx && iwx->be211BSDActive())) && ifp->if_snd.queue &&
+         m && mbuf_type(m) != MBUF_TYPE_FREE && (mbuf_flags(m) & MBUF_PKTHDR) &&
+         ifp->if_snd.queue->lockEnqueue(m))
+         return kIOReturnOutputSuccess;
+@@ -884,6 +894,10 @@ IOReturn AirportItlwm::setHardwareAddress(const void *addrP, UInt32 addrBytes)
+     if (update == AirportWCL::MacUpdate::Busy) {
+         return kIOReturnBusy;
+     }
++    auto iwx = OSDynamicCast(ItlIwx, fHalService);
++    if (iwx && iwx->isBE211ScanOnly() && iwx->be211ScanBusy() &&
++        update != AirportWCL::MacUpdate::Unchanged)
++        return kIOReturnBusy;
+     if (!bsdInterface || !bsdInterface->getIfnet())
+         return kIOReturnNotReady;
+     // WCL calls this directly, bypassing IOEthernetInterface's normal MAC ioctl.
+@@ -1210,6 +1224,27 @@ setPOWER(OSObject *object,
+         return kIOReturnError;
+     IOLog("itlwm: setPOWER: num_radios[%d]  power_state(0:%u  1:%u  2:%u  3:%u)\n", pd->num_radios, pd->power_state[0], pd->power_state[1], pd->power_state[2], pd->power_state[3]);
+     if (pd->num_radios > 0) {
++        auto iwx = OSDynamicCast(ItlIwx, fHalService);
++        if (iwx && iwx->isBE211ScanOnly()) {
++            return _fCommandGate->runAction(
++                [](OSObject *, void *arg0, void *arg1, void *, void *) -> IOReturn {
++                    auto self = static_cast<AirportItlwm *>(arg0);
++                    const bool powered = arg1 != nullptr;
++                    if (self->power_state == powered)
++                        return kIOReturnSuccess;
++                    self->power_state = powered;
++                    if (!powered) {
++                        auto iwx = OSDynamicCast(ItlIwx, self->fHalService);
++                        if (iwx)
++                            iwx->cancelBE211Join("Wi-Fi power off");
++                    }
++                    if (auto iface = OSDynamicCast(AirportItlwmSkywalkInterface, self->fNetIf))
++                        iface->handleWCLEvent(powered ? IEEE80211_EVT_DRIVER_READY :
++                                               IEEE80211_EVT_DRIVER_STOPPED, nullptr);
++                    IOLog("BE211 probe: macOS Wi-Fi power=%u\n", self->power_state);
++                    return kIOReturnSuccess;
++                }, this, pd->power_state[0] ? this : nullptr);
++        }
+         bool isRunning = (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & IFF_RUNNING) != 0;
+         if (pd->power_state[0] == 0) {
+             fHalService->get80211Controller()->ic_wcl_mac_reconfig = false;
+diff --git a/AirportItlwm/IOPCIEDeviceWrapper.cpp b/AirportItlwm/IOPCIEDeviceWrapper.cpp
+index 3658015..8f44b75 100644
+--- a/AirportItlwm/IOPCIEDeviceWrapper.cpp
++++ b/AirportItlwm/IOPCIEDeviceWrapper.cpp
+@@ -85,6 +85,8 @@ probe(IOService *provider, SInt32 *score)
+ #ifdef AIRPORT_WCL
+         if (IwxBE::pciFamily(device->configRead16(kIOPCIConfigDeviceID)) != IwxBE::None) {
+             IOReturn ret = device->configureInterrupts(kIOInterruptTypePCIMessagedX, 1, 1, 0);
++            if (device->configRead16(kIOPCIConfigDeviceID) == 0xe440)
++                IOLog("BE211 probe: MSI-X allocation result=0x%x\n", ret);
+             if (ret != kIOReturnSuccess) {
+                 XYLog("BE MSI-X allocation failed: 0x%x\n", ret);
+                 fHalService->release();
+diff --git a/AirportItlwm/WCL/Sequoia-Info.plist b/AirportItlwm/WCL/Sequoia-Info.plist
+index 829d8f9..28a6757 100644
+--- a/AirportItlwm/WCL/Sequoia-Info.plist
++++ b/AirportItlwm/WCL/Sequoia-Info.plist
+@@ -51,7 +51,9 @@
+ 			<key>IOClass</key>
+ 			<string>IOPCIEDeviceWrapper</string>
+ 			<key>IOPCIMatch</key>
+-			<string>0x27238086 0x43F08086 0xA0F08086 0x34F08086 0x4DF08086 0x02F08086 0x3DF08086 0x06F08086 0x27208086 0x08b18086 0x08b28086 0x08b38086 0x08b48086 0x095a8086 0x095b8086 0x31658086 0x31668086 0x24f38086 0x24f48086 0x24f58086 0x24f68086 0x24fb8086 0x24fd8086 0x25268086 0x9df08086 0xa3708086 0x31DC8086 0x30DC8086 0x271C8086 0x271B8086 0x42a48086 0x00a08086 0x00a48086 0x02a08086 0x40a48086 0x00608086 0x00648086 0x02608086 0x02648086 0x42298086 0x422b8086 0x422c8086 0x42308086 0x42328086 0x42358086 0x42368086 0x42378086 0x42388086 0x42398086 0x423a8086 0x423b8086 0x423c8086 0x423d8086 0x00828086 0x00838086 0x00848086 0x00858086 0x00878086 0x00898086 0x008a8086 0x008b8086 0x00908086 0x00918086 0x08928086 0x08938086 0x08948086 0x08958086 0x08968086 0x08978086 0x08ae8086 0x08af8086 0x088e8086 0x088f8086 0x08908086 0x08918086 0x08878086 0x08888086 0x27258086 0x27268086 0x7A708086 0x7AF08086 0x51F08086 0x54F08086 0x27298086 0x7E408086 0x7F708086 0x51F18086 0x272b8086 0xa8408086 0x77408086 0x4d408086</string>
++			<string>0xe4408086</string>
++			<key>IOPCISecondaryMatch</key>
++			<string>0x01148086</string>
+ 			<key>IOProbeScore</key>
+ 			<integer>70000</integer>
+ 			<key>IOProviderClass</key>
+diff --git a/AirportItlwm/WCL/WCL.cpp b/AirportItlwm/WCL/WCL.cpp
+index 2433820..b05b365 100644
+--- a/AirportItlwm/WCL/WCL.cpp
++++ b/AirportItlwm/WCL/WCL.cpp
+@@ -345,6 +345,14 @@ IOReturn AirportItlwmSkywalkInterface::stopWCLGated(
+     self->portAuthorized = false;
+     self->updateWCLLinkQuality(true);
+     self->wclStopping = true;
++    if (self->be211JoinWork) {
++        auto iwx = OSDynamicCast(ItlIwx, self->fHalService);
++        if (iwx)
++            iwx->cancelBE211Join("WCL stop", true);
++        // The worker clears this under the same gate before the HAL is detached.
++        while (self->be211JoinWork)
++            _fCommandGate->commandSleep(&self->be211JoinWork, THREAD_UNINT);
++    }
+     if (self->fHalService) {
+         auto ic = self->fHalService->get80211Controller();
+         ic->ic_wcl_defer_user_eapol = nullptr;
+@@ -406,6 +414,11 @@ IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1
+     if (self->wclStopping)
+         return kIOReturnNotReady;
+     switch (uintptr_t(a1)) {
++        case 16:
++            if (!a2 || !self->be211JoinWork || !self->wclLinkIndicated || !self->wclBssValid)
++                return kIOReturnNotReady;
++            memcpy(a2, self->wclBssInfo, sizeof(AirportWCL::BeaconMetadata));
++            return kIOReturnSuccess;
+         case 13: return self->copyWCLChannels(a2);
+         case 14: return self->copyWCLTrafficCounters(a2);
+         case 15:
+@@ -424,17 +437,29 @@ IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1
+         case 0: return self->beginWCLScan(static_cast<apple80211ScanRequest *>(a2));
+         case 1: return self->beginWCLJoin(static_cast<apple80211AssocCandidates *>(a2));
+         case 2: return self->abortWCLJoin();
+-        case 3: return self->leaveWCLNetwork();
+-        case 6: return self->copyWCLExtendedBss(a2);
++        case 3: return self->leaveWCLNetwork("WCL leave request");
++        case 6: {
++            const auto status = self->copyWCLExtendedBss(a2);
++            if (self->be211JoinWork)
++                IOLog("BE211 probe: WCL extended BSS query result=0x%x\n", status);
++            return status;
++        }
+         case 7:
+             if (!a2 || !self->wclBssValid || !self->wclAssociatedBeacons)
+                 return kIOReturnNotReady;
++            if (self->be211JoinWork) {
++                const auto iwx = OSDynamicCast(ItlIwx, self->fHalService);
++                return iwx && iwx->copyBE211PeerBeacon(a2, sizeof(self->wclBeaconInfo)) ?
++                    kIOReturnSuccess : kIOReturnNotReady;
++            }
+             memcpy(a2, self->wclBeaconInfo, sizeof(self->wclBeaconInfo));
+             return kIOReturnSuccess;
+         case 5: {
+             if (!a2 || !self->wclBssValid)
+                 return kIOReturnNotReady;
+             memcpy(a2, self->wclBssInfo, sizeof(self->wclBssInfo));
++            if (self->be211JoinWork)
++                return kIOReturnSuccess;
+             auto ic = self->fHalService->get80211Controller();
+             if (uint16_t spec = wclCurrentChannelSpec(ic)) {
+                 auto bss = static_cast<AirportWCL::BeaconMetadata *>(a2);
+@@ -512,6 +537,33 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
+ 
+ IOReturn AirportItlwmSkywalkInterface::startWCLScan(const AirportWCL::ScanRequest &scan)
+ {
++    auto iwx = OSDynamicCast(ItlIwx, fHalService);
++    if (iwx && iwx->isBE211ScanOnly()) {
++        if (!instance->power_state)
++            return kIOReturnNotReady;
++        if (be211JoinWork || iwx->be211ScanBusy() || scanPending)
++            return kIOReturnBusy;
++        if (instance->getWorkLoop()->onThread())
++            return kIOReturnNotReady;
++
++        uint16_t channels = 0;
++        for (unsigned channel = 1; channel <= 11; ++channel) {
++            if (AirportWCL::scanChannelSelected(scan.channels, scan.channelCount != 0, channel))
++                channels |= 1U << (channel - 1);
++        }
++        if (!channels)
++            return kIOReturnUnsupported;
++        clearWCLScanResults();
++        deferredScan = scan;
++        scanPending = true;
++        scanDeferred = scanCompleted = false;
++        IOLog("BE211 probe: macOS requested passive scan mask=0x%x\n", channels);
++        const int err = iwx->scanBE211(channels);
++        IOLog("BE211 probe: macOS scan result=%d buffered networks=%u\n",
++              err, wclScanResultCount);
++        finishWCLScan(err ? kIOReturnError : kIOReturnSuccess);
++        return kIOReturnSuccess;
++    }
+     ieee80211com *ic = fHalService->get80211Controller();
+     if (!(ic->ic_if.if_flags & IFF_RUNNING)) {
+         /*
+@@ -889,13 +941,122 @@ IOReturn AirportItlwmSkywalkInterface::accessWCLRSN(apple80211_rsn_ie_data *data
+     return kIOReturnSuccess;
+ }
+ 
++struct AirportItlwmSkywalkInterface::BE211JoinWork {
++    AirportItlwmSkywalkInterface *interface;
++    IOCommandGate *gate;
++    thread_call_t call;
++    uint8_t ssid[IEEE80211_NWID_LEN];
++    size_t ssidLength;
++    uint8_t bssid[IEEE80211_ADDR_LEN];
++};
++
++IOReturn AirportItlwmSkywalkInterface::queueBE211Join(const AirportWCL::JoinRequest &join)
++{
++    if (be211JoinWork || joinPending || scanPending)
++        return kIOReturnBusy;
++    if (!join.ssidLength || join.ssidLength > IEEE80211_NWID_LEN)
++        return kIOReturnBadArgument;
++    auto work = static_cast<BE211JoinWork *>(IOMalloc(sizeof(BE211JoinWork)));
++    if (!work)
++        return kIOReturnNoMemory;
++    work->call = thread_call_allocate(be211JoinThread, work);
++    if (!work->call) {
++        IOFree(work, sizeof(*work));
++        return kIOReturnNoMemory;
++    }
++    work->interface = this;
++    work->gate = _fCommandGate;
++    work->ssidLength = join.ssidLength;
++    memcpy(work->ssid, join.ssid, work->ssidLength);
++    IEEE80211_ADDR_COPY(work->bssid, join.bssid);
++    IEEE80211_ADDR_COPY(joinBSSID, join.bssid);
++    current_authtype_lower = join.lowerAuth;
++    current_authtype_upper = join.upperAuth;
++    assocNotified = firstBeaconNotified = portAuthorized = false;
++    wclBssValid = wclLinkIndicated = false;
++    wclAssociatedBeacons = 0;
++    be211JoinCancelled = false;
++    joinPending = true;
++    be211JoinWork = work;
++    retain();
++    work->gate->retain();
++    IOLog("BE211 probe: WCL join queued\n");
++    thread_call_enter(work->call);
++    return kIOReturnSuccess;
++}
++
++void AirportItlwmSkywalkInterface::be211JoinThread(void *arg, void *)
++{
++    auto work = static_cast<BE211JoinWork *>(arg);
++    work->gate->runAction(be211JoinGated, work);
++    thread_call_free(work->call);
++    work->interface->release();
++    work->gate->release();
++    IOFree(work, sizeof(*work));
++}
++
++IOReturn AirportItlwmSkywalkInterface::be211JoinGated(
++    OSObject *, void *arg, void *, void *, void *)
++{
++    auto work = static_cast<BE211JoinWork *>(arg);
++    auto self = work->interface;
++    auto iwx = OSDynamicCast(ItlIwx, self->fHalService);
++    int err = ECANCELED;
++    if (iwx && !self->wclStopping && !self->be211JoinCancelled && self->instance->power_state)
++        err = iwx->probeBE211Join(work->ssid, work->ssidLength, work->bssid,
++                                  publishBE211Association, self);
++    if (!self->wclStopping && self->joinPending)
++        self->finishWCLJoin(1, 0, err == ECANCELED ? kIOReturnAborted : kIOReturnError);
++    IOLog("BE211 probe: WCL join worker complete result=%d\n", err);
++    self->be211JoinWork = nullptr;
++    work->gate->commandWakeup(&self->be211JoinWork);
++    return kIOReturnSuccess;
++}
++
++bool AirportItlwmSkywalkInterface::publishBE211Association(
++    void *arg, const ieee80211_beacon_event &beacon)
++{
++    auto self = static_cast<AirportItlwmSkywalkInterface *>(arg);
++    if (self->wclStopping || self->be211JoinCancelled || !self->joinPending)
++        return false;
++    IEEE80211_ADDR_COPY(self->joinBSSID, beacon.node->ni_bssid);
++    auto ic = self->fHalService->get80211Controller();
++    ic->ic_assoc_status = 0;
++    ic->ic_wcl_peer_is_mlo = false;
++    self->handleWCLEvent(IEEE80211_EVT_STA_ASSOC_DONE, nullptr);
++    auto event = beacon;
++    self->handleWCLEvent(IEEE80211_EVT_BEACON, &event);
++    IOLog("BE211 probe: WCL real peer beacon published=%u\n",
++          static_cast<unsigned>(self->firstBeaconNotified));
++    return self->firstBeaconNotified;
++}
++
++bool AirportItlwmSkywalkInterface::copyBE211CurrentBss(AirportWCL::BeaconMetadata &bss)
++{
++    auto iwx = OSDynamicCast(ItlIwx, fHalService);
++    return iwx && iwx->isBE211ScanOnly() && _fCommandGate &&
++        _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(16), &bss) ==
++            kIOReturnSuccess;
++}
++
+ IOReturn AirportItlwmSkywalkInterface::beginWCLJoin(apple80211AssocCandidates *request)
+ {
++    auto iwx = OSDynamicCast(ItlIwx, fHalService);
+     AirportWCL::JoinRequest join;
+     if (!AirportWCL::decodeJoin(request, 0x2cc, join)) {
+         explicit_bzero(&join, sizeof(join));
+         return kIOReturnBadArgument;
+     }
++    if (iwx && iwx->isBE211ScanOnly()) {
++        const bool open = AirportWCL::classifyLegacyAuth(join) == AirportWCL::LegacyAuth::Open;
++        if (!open || !instance->power_state) {
++            explicit_bzero(&join, sizeof(join));
++            return open ? kIOReturnNotReady : kIOReturnUnsupported;
++        }
++        const auto status = queueBE211Join(join);
++        explicit_bzero(&join, sizeof(join));
++        return status;
++    }
+     return startWCLJoin(join);
+ }
+ 
+@@ -1017,7 +1178,7 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
+     setbit(joinBand == AirportWCL::ChannelBand::GHz6 ? joinChannels6GHz : joinChannels,
+            joinChannel);
+     if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
+-        leaveWCLNetwork();
++        leaveWCLNetwork("WCL replacement join");
+     ieee80211_disable_rsn(ic);
+     ieee80211_disable_wep(ic);
+     explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+@@ -1173,6 +1334,8 @@ void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reaso
+     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
+     joinTimer->cancelTimeout();
+     instance->postMessage(this, AirportWCL::ConnectComplete, &event, sizeof(event), true);
++    if (be211JoinWork)
++        IOLog("BE211 probe: WCL ConnectComplete status=%u driver=0x%x\n", status, driverStatus);
+     if (status) {
+         purgeWCLUserEapol();
+         portAuthorized = false;
+@@ -1194,12 +1357,21 @@ void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventS
+     auto self = OSDynamicCast(AirportItlwmSkywalkInterface, owner);
+     if (self && !self->wclStopping) {
+         self->finishWCLJoin(1, 1004, kIOReturnTimeout);
+-        self->leaveWCLNetwork();
++        self->leaveWCLNetwork("WCL join timer");
+     }
+ }
+ 
+-IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
++IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork(const char *source)
+ {
++    auto iwx = OSDynamicCast(ItlIwx, fHalService);
++    if (iwx && iwx->isBE211ScanOnly()) {
++        IOLog("BE211 probe: WCL cancellation request source=%s worker=%u pending=%u\n",
++              source, static_cast<unsigned>(be211JoinWork != nullptr),
++              static_cast<unsigned>(joinPending));
++        be211JoinCancelled = true;
++        iwx->cancelBE211Join(source);
++        return kIOReturnSuccess;
++    }
+     ieee80211com *ic = fHalService->get80211Controller();
+ #ifdef __PRIVATE_SPI__
+     if (instance->bsdInterface) {
+@@ -1238,7 +1410,7 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
+ 
+ IOReturn AirportItlwmSkywalkInterface::abortWCLJoin()
+ {
+-    leaveWCLNetwork();
++    leaveWCLNetwork("WCL join abort");
+     instance->postMessage(this, AirportWCL::JoinAbortComplete, nullptr, 0, true);
+     return kIOReturnSuccess;
+ }
+@@ -1492,6 +1664,11 @@ IOReturn AirportItlwmSkywalkInterface::setWCL_LINK_STATE_UPDATE(apple80211_wcl_u
+         return kIOReturnBadArgument;
+ #if __IO80211_TARGET == __MAC_15_2
+     const auto bytes = reinterpret_cast<const uint8_t *>(data);
++    auto iwx = OSDynamicCast(ItlIwx, fHalService);
++    if (iwx && iwx->isBE211ScanOnly())
++        IOLog("BE211 probe: WCL native link update associated=%u link_up=%u set_ap=%u\n",
++              static_cast<unsigned>(bytes[6]), static_cast<unsigned>(bytes[7]),
++              static_cast<unsigned>(bytes[8]));
+     if (bytes[6]) {
+         if (bytes[8])
+             setCurrentApAddress(reinterpret_cast<ether_addr *>(data));
+@@ -1566,8 +1743,18 @@ IOReturn AirportItlwmSkywalkInterface::getWCL_EXTENDED_BSS_INFO(apple80211_exten
+ IOReturn AirportItlwmSkywalkInterface::copyWCLExtendedBss(void *data)
+ {
+     ieee80211com *ic = fHalService->get80211Controller();
+-    if (!data || !ic->ic_bss || ic->ic_state != IEEE80211_S_RUN)
++    const bool be211 = be211JoinWork != nullptr;
++    ieee80211_rateset associationRates = {};
++    if (!data)
+         return kIOReturnNotReady;
++    if (be211) {
++        auto iwx = OSDynamicCast(ItlIwx, fHalService);
++        if (!wclLinkIndicated || !wclBssValid || !iwx ||
++            !iwx->copyBE211AssociationRates(associationRates))
++            return kIOReturnNotReady;
++    } else if (!ic->ic_bss || ic->ic_state != IEEE80211_S_RUN) {
++        return kIOReturnNotReady;
++    }
+     static_assert(sizeof(apple80211_rate_set_data) == 0xbc, "Extended BSS rates size");
+     static_assert(sizeof(apple80211_mcs_index_set_data) == 0x10, "Extended BSS MCS size");
+     auto bytes = static_cast<uint8_t *>(data);
+@@ -1576,22 +1763,37 @@ IOReturn AirportItlwmSkywalkInterface::copyWCLExtendedBss(void *data)
+ #else
+     bzero(bytes, 0x214);
+ #endif
+-    IOReturn status = getRATE_SET(reinterpret_cast<apple80211_rate_set_data *>(bytes));
+-    if (status)
+-        return status;
+-    status = getMCS_INDEX_SET(reinterpret_cast<apple80211_mcs_index_set_data *>(bytes + 0xbc));
+-    if (status)
+-        return status;
++    auto rates = reinterpret_cast<apple80211_rate_set_data *>(bytes);
++    auto mcs = reinterpret_cast<apple80211_mcs_index_set_data *>(bytes + 0xbc);
++    if (be211) {
++        rates->version = APPLE80211_VERSION;
++        rates->num_rates = MIN(associationRates.rs_nrates, nitems(rates->rates));
++        for (unsigned index = 0; index < rates->num_rates; ++index) {
++            rates->rates[index].version = APPLE80211_VERSION;
++            rates->rates[index].rate = associationRates.rs_rates[index];
++        }
++        // This open-network join requests legacy rates only.
++        mcs->version = APPLE80211_VERSION;
++        IOLog("BE211 probe: WCL extended BSS using active legacy association rates=%u\n",
++              static_cast<unsigned>(rates->num_rates));
++    } else {
++        const auto rateStatus = getRATE_SET(rates);
++        if (rateStatus)
++            return rateStatus;
++        const auto mcsStatus = getMCS_INDEX_SET(mcs);
++        if (mcsStatus)
++            return mcsStatus;
++    }
+     apple80211_vht_mcs_index_set_data vht = {};
+     vht.version = APPLE80211_VERSION;
+     vht.mcs_map = 0xffff;
+-    if (ic->ic_bss->ni_flags & IEEE80211_NODE_VHT)
++    if (!be211 && (ic->ic_bss->ni_flags & IEEE80211_NODE_VHT))
+         vht.mcs_map = ic->ic_bss->ni_vht_mcsinfo.tx_mcs_map;
+     memcpy(bytes + 0xcc, &vht, sizeof(vht));
+     // Native updateMCSSet uses version + a 16-bit HE MCS/NSS map (8 bytes).
+     uint32_t heVersion = APPLE80211_VERSION;
+     uint16_t heMap = 0xffff;
+-    if (ic->ic_bss->ni_flags & IEEE80211_NODE_HE) {
++    if (!be211 && (ic->ic_bss->ni_flags & IEEE80211_NODE_HE)) {
+         bool wide = ic->ic_bss->ni_chw == IEEE80211_CHAN_WIDTH_160;
+         heMap = htole16(ieee80211_he_mcs_intersection(
+             le16toh(wide ? ic->ic_he_mcs_nss_supp.rx_mcs_160 : ic->ic_he_mcs_nss_supp.rx_mcs_80),
+@@ -1599,7 +1801,7 @@ IOReturn AirportItlwmSkywalkInterface::copyWCLExtendedBss(void *data)
+     }
+     memcpy(bytes + 0xd4, &heVersion, sizeof(heVersion));
+     memcpy(bytes + 0xd8, &heMap, sizeof(heMap));
+-    if (ic->ic_flags & IEEE80211_F_RSNON)
++    if (!be211 && (ic->ic_flags & IEEE80211_F_RSNON))
+ #if __IO80211_TARGET == __MAC_15_2
+         ieee80211_add_rsn(bytes + 0xdd, ic, ic->ic_bss);
+ #else
+diff --git a/itl80211/openbsd/sys/_if_ether.h b/itl80211/openbsd/sys/_if_ether.h
+index 9e206eb..941b9fe 100644
+--- a/itl80211/openbsd/sys/_if_ether.h
++++ b/itl80211/openbsd/sys/_if_ether.h
+@@ -284,7 +284,7 @@ if_detach(struct _ifnet *ifp)
+     return 0;
+ }
+ 
+-static inline int
++static inline void
+ ether_ifattach(struct _ifnet *ifp, IOEthernetInterface *iface)
+ {
+     ifp->iface = iface;
+diff --git a/itlwm/hal_iwx/ItlIwx.cpp b/itlwm/hal_iwx/ItlIwx.cpp
+index 317881c..1d2d859 100644
+--- a/itlwm/hal_iwx/ItlIwx.cpp
++++ b/itlwm/hal_iwx/ItlIwx.cpp
+@@ -444,6 +444,9 @@ getDriverController()
+ 
+ IOReturn ItlIwx::enable(IONetworkInterface *netif)
+ {
++    // SC firmware is started on demand by the passive scan path.
++    if (com.sc_be.family == IwxBE::SC)
++        return kIOReturnUnsupported;
+     XYLog("%s\n", __PRETTY_FUNCTION__);
+     struct _ifnet *ifp = &com.sc_ic.ic_ac.ac_if;
+     if (ifp->if_flags & IFF_UP) {
+@@ -458,6 +461,8 @@ IOReturn ItlIwx::enable(IONetworkInterface *netif)
+ 
+ IOReturn ItlIwx::disable(IONetworkInterface *netif)
+ {
++    if (isBE211ScanOnly())
++        cancelBE211Join("HAL disable");
+     XYLog("%s\n", __FUNCTION__);
+     struct _ifnet *ifp = &com.sc_ic.ic_ac.ac_if;
+     if (!(ifp->if_flags & IFF_UP)) {
+@@ -481,6 +486,8 @@ clearScanningFlags()
+ bool ItlIwx::
+ setCountryCode(const char *countryCode)
+ {
++    if (com.sc_be.family == IwxBE::SC)
++        return false;
+     if (!iwx_valid_mcc(countryCode))
+         return false;
+ 
+@@ -1616,6 +1623,8 @@ iwx_fw_info_free(struct iwx_fw_info *fw)
+     ::free(fw->fw_rawdata);
+     fw->fw_rawdata = NULL;
+     fw->fw_rawsize = 0;
++    fw->embedded_pnvm = NULL;
++    fw->embedded_pnvm_size = 0;
+     /* don't touch fw->fw_status */
+     memset(fw->fw_sects, 0, sizeof(fw->fw_sects));
+ }
+@@ -1659,6 +1668,22 @@ iwx_free_pnvm_dma(struct iwx_softc *sc)
+ int ItlIwx::
+ iwx_read_firmware(struct iwx_softc *sc)
+ {
++    if (sc->sc_be.family == IwxBE::SC) {
++        // This probe is limited to the Framework's SC A0 / WH B0 radio.
++        if (sc->sc_hw_rev != 0x480 || sc->sc_hw_rf_id != 0x20113100) {
++            IOLog("BE211 probe: unexpected HW_REV=0x%x RF_ID=0x%x\n",
++                  sc->sc_hw_rev, sc->sc_hw_rf_id);
++            return ENOTSUP;
++        }
++        sc->sc_fwname = "iwlwifi-sc-a0-wh-b0-c106.ucode";
++        int err = iwx_read_firmware_file(sc);
++        if (!err && (sc->sc_fw_api != 106 ||
++                     iwx_lookup_notif_ver(sc, IWX_LEGACY_GROUP, IWX_ALIVE) != 8))
++            err = ENOTSUP;
++        IOLog("BE211 probe: firmware parse result=%d API=%u ALIVE version=%u\n",
++              err, sc->sc_fw_api, iwx_lookup_notif_ver(sc, IWX_LEGACY_GROUP, IWX_ALIVE));
++        return err;
++    }
+     if (sc->sc_be.family == IwxBE::None)
+         return iwx_read_firmware_file(sc);
+     if (sc->sc_fw.fw_status == IWX_FW_STATUS_DONE)
+@@ -1983,6 +2008,17 @@ iwx_read_firmware_file(struct iwx_softc *sc)
+                 }
+                 break;
+                 
++            case IWX_UCODE_TLV_PNVM_DATA:
++                if (sc->sc_be.family != IwxBE::SC)
++                    break;
++                if (!tlv_len || fw->embedded_pnvm) {
++                    err = EINVAL;
++                    goto parse_out;
++                }
++                fw->embedded_pnvm = (const uint8_t *)tlv_data;
++                fw->embedded_pnvm_size = tlv_len;
++                break;
++
+             case IWX_UCODE_TLV_FW_VERSION:
+                 if (tlv_len != sizeof(uint32_t) * 3) {
+                     err = EINVAL;
+@@ -2374,6 +2410,9 @@ done:
+         htole64(sc->pnvm_dram.paddr);
+     prph_sc_ctrl->pnvm_cfg.pnvm_size =
+         htole32(size);
++    if (sc->sc_be.family == IwxBE::SC)
++        IOLog("BE211 probe: PNVM staged version=0x%08x segments=%d bytes=%u\n",
++              sha1, segment_count, size);
+     
+ out:
+     ::free(pnvm_data);
+@@ -2389,13 +2428,22 @@ iwx_read_pnvm(struct iwx_softc *sc)
+     struct iwx_fw_info *fw = &sc->sc_fw;
+     char fwname_copy[64];
+     char pnvm_name[64];
+-    struct iwx_ucode_tlv *tlv;
+-    uint8_t *data;
++    const struct iwx_ucode_tlv *tlv;
++    const uint8_t *data;
+     size_t len;
+     const char *find;
+     
+     if (fw->pnvm_rawdata != NULL)
+         iwx_pnvm_free(fw);
++    if (sc->sc_be.family == IwxBE::SC) {
++        if (!fw->embedded_pnvm)
++            return ENOENT;
++        data = fw->embedded_pnvm;
++        len = fw->embedded_pnvm_size;
++        sc->sc_pcitag->setProperty("AirportItlwm-PNVMName", "embedded Core 106");
++        goto parse;
++    }
++
+     strlcpy(fwname_copy, sc->sc_fwname, sizeof(fwname_copy));
+     find = strrchr(sc->sc_fwname, '-');
+     if (!find)
+@@ -2421,16 +2469,17 @@ iwx_read_pnvm(struct iwx_softc *sc)
+     uncompressFirmware((u_char *)fw->pnvm_rawdata, (uint *)&fw->pnvm_rawsize, (u_char *)fwData->getBytesNoCopy(), fwData->getLength());
+     XYLog("load firmware %s done %zu\n", pnvm_name, fw->pnvm_rawsize);
+     
+-    XYLog("Parsing PNVM file\n");
+-    
+-    data = (uint8_t *)fw->pnvm_rawdata;
++    data = (const uint8_t *)fw->pnvm_rawdata;
+     len = fw->pnvm_rawsize;
++
++parse:
++    XYLog("Parsing PNVM data\n");
+     
+     while (len >= sizeof(*tlv)) {
+         uint32_t tlv_len, tlv_type;
+ 
+         len -= sizeof(*tlv);
+-        tlv = (struct iwx_ucode_tlv *)data;
++        tlv = (const struct iwx_ucode_tlv *)data;
+ 
+         tlv_len = le32toh(tlv->length);
+         tlv_type = le32toh(tlv->type);
+@@ -2443,8 +2492,12 @@ iwx_read_pnvm(struct iwx_softc *sc)
+         }
+ 
+         if (tlv_type == IWX_UCODE_TLV_PNVM_SKU) {
+-            struct iwx_sku_id *sku_id =
+-                (struct iwx_sku_id *)(data + sizeof(*tlv));
++            if (tlv_len < sizeof(struct iwx_sku_id)) {
++                err = EINVAL;
++                goto out;
++            }
++            const struct iwx_sku_id *sku_id =
++                (const struct iwx_sku_id *)(data + sizeof(*tlv));
+ 
+             XYLog("Got IWL_UCODE_TLV_PNVM_SKU len %d\n",
+                      tlv_len);
+@@ -3008,8 +3061,10 @@ iwx_alloc_tx_ring(struct iwx_softc *sc, struct iwx_tx_ring *ring, int qid)
+     bus_size_t size;
+     int i, err;
+ 
+-    /* 0:CMD 2:MGMT */
+-    if (qid > IWX_QID_MGMT) {
++    // BE211's boot and scan paths use only the host command ring.
++    // Firmware assigns data queue IDs dynamically, including low IDs.
++    if (qid > IWX_QID_MGMT ||
++        (sc->sc_be.family == IwxBE::SC && qid != IWX_DQA_CMD_QUEUE)) {
+         ring->qid = IWX_INVALID_QUEUE;
+         return 0;
+     }
+@@ -5479,18 +5534,68 @@ iwx_nvm_get(struct iwx_softc *sc)
+     size_t resp_len = v4 ? sizeof(*rsp) : sizeof(*rsp_v3);
+ 
+     
+-    hcmd.resp_pkt_len = sizeof(struct iwx_rx_packet) + resp_len;
++    bool sc_probe = sc->sc_be.family == IwxBE::SC;
++    if (sc_probe) {
++        unsigned cmd_version = iwx_lookup_cmd_ver(sc, IWX_REGULATORY_AND_NVM_GROUP,
++                                                   IWX_NVM_GET_INFO);
++        unsigned resp_version = iwx_lookup_notif_ver(sc, IWX_REGULATORY_AND_NVM_GROUP,
++                                                     IWX_NVM_GET_INFO);
++        IOLog("BE211 probe: NVM_GET_INFO command v%u response v%u\n",
++              cmd_version, resp_version);
++        if (cmd_version != 1 || resp_version != 5)
++            return ENOTSUP;
++        resp_len = sizeof(struct iwx_nvm_get_info_rsp_v5);
++    }
++
++    hcmd.resp_pkt_len = sc_probe ? IWX_CMD_RESP_MAX :
++        sizeof(struct iwx_rx_packet) + resp_len;
+     err = iwx_send_cmd(sc, &hcmd);
+     if (err)
+         return err;
+ 
+-    size_t actual_resp_len = iwx_rx_packet_payload_len(hcmd.resp_pkt);
+-    
+-    if (actual_resp_len != resp_len) {
++    if (!hcmd.resp_pkt) {
+         err = EIO;
+         goto out;
+     }
+-    
++    if (iwx_rx_packet_payload_len(hcmd.resp_pkt) != resp_len) {
++        if (sc_probe)
++            IOLog("BE211 probe: unexpected NVM payload=%zu expected=%zu\n",
++                  (size_t)iwx_rx_packet_payload_len(hcmd.resp_pkt), resp_len);
++        err = EIO;
++        goto out;
++    }
++
++    if (sc_probe) {
++        const auto *info = (const struct iwx_nvm_get_info_rsp_v5 *)hcmd.resp_pkt->data;
++        unsigned channels = le32toh(info->n_channels);
++        if (channels > nitems(info->channel_profile)) {
++            IOLog("BE211 probe: invalid NVM channel count=%u\n", channels);
++            err = EINVAL;
++            goto out;
++        }
++        IOLog("BE211 probe: NVM version=0x%04x board=%u flags=0x%08x SKU=0x%08x TX=0x%x RX=0x%x LAR=%u channels=%u\n",
++              le16toh(info->general.nvm_version), info->general.board_type,
++              le32toh(info->general.flags), le32toh(info->mac_sku.mac_sku_flags),
++              le32toh(info->phy_sku.tx_chains), le32toh(info->phy_sku.rx_chains),
++              le32toh(info->lar_enabled), channels);
++        // Both supported NVM channel layouts begin with channels 1 through 14.
++        sc->sc_be211_nvm_scan_channels = 0;
++        sc->sc_be211_nvm_active_channels = 0;
++        for (unsigned index = 0; index < MIN(channels, 11U); ++index) {
++            const uint32_t flags = le32toh(info->channel_profile[index]);
++            if (flags & IWX_NVM_CHANNEL_VALID)
++                sc->sc_be211_nvm_scan_channels |= 1U << index;
++            if ((flags & (IWX_NVM_CHANNEL_VALID | IWX_NVM_CHANNEL_ACTIVE | IWX_NVM_CHANNEL_RADAR)) ==
++                (IWX_NVM_CHANNEL_VALID | IWX_NVM_CHANNEL_ACTIVE))
++                sc->sc_be211_nvm_active_channels |= 1U << index;
++        }
++        // The runtime antenna command uses the intersection of these
++        // masks and the firmware PHY SKU.
++        nvm->valid_tx_ant = le32toh(info->phy_sku.tx_chains) & 0xf;
++        nvm->valid_rx_ant = le32toh(info->phy_sku.rx_chains) & 0xf;
++        goto out;
++    }
++
+     memset(nvm, 0, sizeof(*nvm));
+     
+     err = iwx_set_mac_addr_from_csr(sc, nvm);
+@@ -5672,7 +5777,7 @@ int ItlIwx::
+ iwx_send_phy_cfg_cmd(struct iwx_softc *sc)
+ {
+     XYLog("%s\n", __FUNCTION__);
+-    struct iwx_phy_cfg_cmd_v3 phy_cfg_cmd;
++    struct iwx_phy_cfg_cmd_v3 phy_cfg_cmd = {};
+     uint8_t cmdver;
+     
+     phy_cfg_cmd.phy_cfg = htole32(sc->sc_fw_phy_config);
+@@ -5688,40 +5793,1294 @@ iwx_send_phy_cfg_cmd(struct iwx_softc *sc)
+                             sizeof(struct iwx_phy_cfg_cmd_v1), &phy_cfg_cmd);
+ }
+ 
+-int ItlIwx::
+-iwx_send_dqa_cmd(struct iwx_softc *sc)
++int ItlIwx::
++iwx_send_dqa_cmd(struct iwx_softc *sc)
++{
++    XYLog("%s\n", __FUNCTION__);
++    struct iwx_dqa_enable_cmd dqa_cmd = {
++        .cmd_queue = htole32(IWX_DQA_CMD_QUEUE),
++    };
++    uint32_t cmd_id;
++    
++    cmd_id = iwx_cmd_id(IWX_DQA_ENABLE_CMD, IWX_DATA_PATH_GROUP, 0);
++    return iwx_send_cmd_pdu(sc, cmd_id, 0, sizeof(dqa_cmd), &dqa_cmd);
++}
++
++int ItlIwx::
++iwx_load_ucode_wait_alive(struct iwx_softc *sc)
++{
++    XYLog("%s\n", __FUNCTION__);
++    int err;
++    
++    err = iwx_read_firmware(sc);
++    if (err)
++        return err;
++    
++    err = iwx_start_fw(sc);
++    if (err) {
++        if (sc->sc_be.family == IwxBE::SC)
++            IOLog("BE211 probe: firmware startup result=%d\n", err);
++        return err;
++    }
++    
++    if (sc->sc_be.family == IwxBE::SC)
++        IOLog("BE211 probe: firmware ALIVE accepted\n");
++
++    err = iwx_load_pnvm(sc);
++    if (sc->sc_be.family == IwxBE::SC)
++        IOLog("BE211 probe: PNVM result=%d payload=%u status=0x%08x\n",
++              err, sc->sc_pnvm_payload_len, sc->sc_pnvm_status);
++    // The completion wait validates the payload. Linux logs the status and
++    // proceeds, including with 0x00050001 on this hardware and firmware.
++    if (err)
++        return err;
++
++    iwx_post_alive(sc);
++    
++    return 0;
++}
++
++// Linux iwlwifi SHARED_MEM_ALLOC_API_S_VER_4.
++struct iwx_be211_shared_mem_v4 {
++    uint32_t shared_mem_addr;
++    uint32_t shared_mem_size;
++    uint32_t sample_buff_addr;
++    uint32_t sample_buff_size;
++    uint32_t rxfifo2_addr;
++    uint32_t rxfifo2_size;
++    uint32_t page_buff_addr;
++    uint32_t page_buff_size;
++    uint32_t lmac_num;
++    struct {
++        uint32_t txfifo_addr;
++        uint32_t txfifo_size[15];
++        uint32_t rxfifo1_addr;
++        uint32_t rxfifo1_size;
++    } lmac[3];
++    uint32_t rxfifo2_control_addr;
++    uint32_t rxfifo2_control_size;
++} __packed;
++static_assert(sizeof(iwx_be211_shared_mem_v4) == 260, "shared-memory response v4 size");
++
++int ItlIwx::
++iwx_be211_shared_mem_probe(struct iwx_softc *sc)
++{
++    unsigned version = iwx_lookup_notif_ver(sc, IWX_SYSTEM_GROUP,
++                                           IWX_SHARED_MEM_CFG_CMD);
++    IOLog("BE211 probe: SHARED_MEM_CFG response v%u\n", version);
++    if (version != 4 ||
++        !isset(sc->sc_enabled_capa, IWX_UCODE_TLV_CAPA_EXTEND_SHARED_MEM_CFG))
++        return ENOTSUP;
++
++    struct iwx_host_cmd cmd = {};
++    cmd.id = IWX_WIDE_ID(IWX_SYSTEM_GROUP, IWX_SHARED_MEM_CFG_CMD);
++    cmd.flags = IWX_CMD_WANT_RESP;
++    cmd.resp_pkt_len = IWX_CMD_RESP_MAX;
++    int err = iwx_send_cmd(sc, &cmd);
++    if (err)
++        return err;
++    if (!cmd.resp_pkt)
++        return EIO;
++
++    size_t len = iwx_rx_packet_payload_len(cmd.resp_pkt);
++    if (len == sizeof(iwx_be211_shared_mem_v4)) {
++        const auto *info =
++            (const iwx_be211_shared_mem_v4 *)cmd.resp_pkt->data;
++        unsigned lmacs = le32toh(info->lmac_num);
++        IOLog("BE211 probe: SHARED_MEM_CFG bytes=%zu LMACs=%u RXFIFO2=%u control=%u\n",
++              len, lmacs, le32toh(info->rxfifo2_size),
++              le32toh(info->rxfifo2_control_size));
++        if (lmacs < 1 || lmacs > 2)
++            err = EIO;
++    } else {
++        IOLog("BE211 probe: unexpected SHARED_MEM_CFG payload=%zu expected=%zu\n",
++              len, sizeof(iwx_be211_shared_mem_v4));
++        err = EIO;
++    }
++    iwx_free_resp(sc, &cmd);
++    return err;
++}
++
++// Core 106 PHY_CONTEXT v6 uses the SBB word and the trailing control location.
++struct iwx_be211_phy_context_v6 {
++    uint32_t id_and_color;
++    uint32_t action;
++    struct iwx_fw_channel_info channel;
++    uint32_t lmac_id;
++    uint8_t sbb_bandwidth;
++    uint8_t sbb_control_location;
++    uint16_t puncture_mask;
++    uint32_t dsp_config_flags;
++    uint8_t secondary_control_location;
++    uint8_t reserved[3];
++} __packed;
++
++// MAC_CONFIG v4 preserves the common header and extends the data union for NAN.
++struct iwx_be211_mac_context_v4 {
++    uint32_t id_and_color;
++    uint32_t action;
++    uint32_t mac_type;
++    uint8_t local_address[IEEE80211_ADDR_LEN];
++    uint16_t reserved;
++    uint32_t filter_flags;
++    uint8_t he_support;
++    uint8_t he_ap_support;
++    uint8_t eht_support;
++    uint8_t uhr_support;
++    uint32_t wifi_gen_reserved;
++    uint32_t nic_not_ack_enabled;
++    union {
++        struct iwx_mld_mac_client_data client;
++        uint8_t nan_data[20];
++    };
++} __packed;
++
++// LINK_CONFIG v8 preserves the legacy prefix and uses the v7+ tail.
++struct iwx_be211_link_context_v8 {
++    uint32_t action;
++    uint32_t link_id;
++    uint32_t mac_id;
++    uint32_t phy_id;
++    uint8_t local_address[IEEE80211_ADDR_LEN];
++    uint16_t reserved_address;
++    uint32_t modify_mask;
++    uint32_t active;
++    uint8_t block_tx;
++    uint8_t modify_bandwidth;
++    uint8_t reserved_bandwidth[2];
++    uint32_t cck_rates;
++    uint32_t ofdm_rates;
++    uint32_t cck_short_preamble;
++    uint32_t short_slot;
++    uint32_t protection_flags;
++    uint32_t qos_flags;
++    struct iwx_ac_qos ac[IWX_AC_NUM + 1];
++    uint8_t htc_trig_based_pkt_ext;
++    uint8_t rand_alloc_ecwmin;
++    uint8_t rand_alloc_ecwmax;
++    uint8_t ndp_fdbk_buff_th_exp;
++    struct iwx_mld_he_backoff_conf trig_based_txf[IWX_AC_NUM];
++    uint32_t beacon_interval;
++    uint32_t dtim_interval;
++    uint16_t reserved_puncture_mask;
++    uint16_t frame_time_rts_th;
++    uint32_t flags;
++    uint32_t reserved_flags_mask;
++    uint8_t ref_bssid[IEEE80211_ADDR_LEN];
++    uint16_t reserved_ref_bssid;
++    uint8_t bssid_index;
++    uint8_t bss_color;
++    uint8_t spec_link_id;
++    uint8_t ul_mu_data_disable;
++    uint8_t ibss_bssid[IEEE80211_ADDR_LEN];
++    uint16_t reserved_ibss_bssid;
++    uint8_t npca_params[8];
++    struct iwx_ac_qos prio_edca_params;
++    uint32_t reserved_tail[4];
++} __packed;
++
++static_assert(sizeof(iwx_be211_link_context_v8) == 208, "LINK_CONFIG v8 size");
++static_assert(offsetof(iwx_be211_link_context_v8, phy_id) == 12, "LINK_CONFIG v8 PHY offset");
++static_assert(offsetof(iwx_be211_link_context_v8, modify_mask) == 24, "LINK_CONFIG v8 mask offset");
++static_assert(offsetof(iwx_be211_link_context_v8, cck_rates) == 36, "LINK_CONFIG v8 rates offset");
++static_assert(offsetof(iwx_be211_link_context_v8, qos_flags) == 56, "LINK_CONFIG v8 QoS offset");
++static_assert(offsetof(iwx_be211_link_context_v8, ac) == 60, "LINK_CONFIG v8 EDCA offset");
++static_assert(offsetof(iwx_be211_link_context_v8, beacon_interval) == 136, "LINK_CONFIG v8 beacon offset");
++static_assert(offsetof(iwx_be211_link_context_v8, spec_link_id) == 166, "LINK_CONFIG v8 spec link offset");
++static_assert(offsetof(iwx_be211_link_context_v8, npca_params) == 176, "LINK_CONFIG v8 NPCA offset");
++
++static_assert(sizeof(iwx_be211_phy_context_v6) == 32, "PHY_CONTEXT v6 size");
++static_assert(offsetof(iwx_be211_phy_context_v6, secondary_control_location) == 28,
++              "PHY_CONTEXT v6 secondary control location");
++static_assert(sizeof(iwx_be211_mac_context_v4) == 56, "MAC_CONFIG v4 size");
++static_assert(offsetof(iwx_be211_mac_context_v4, client) == 36, "MAC_CONFIG v4 client offset");
++
++// STA_CONFIG v3 uses a link mask and the extended DPS/NAN tail.
++struct iwx_be211_sta_config_v3 {
++    uint32_t sta_id;
++    uint32_t link_mask;
++    uint8_t peer_mld_address[IEEE80211_ADDR_LEN];
++    uint16_t reserved_mld;
++    uint8_t peer_link_address[IEEE80211_ADDR_LEN];
++    uint16_t reserved_link;
++    uint32_t station_type;
++    uint32_t assoc_id;
++    uint32_t beamform_flags;
++    uint32_t mfp;
++    uint32_t mimo;
++    uint32_t mimo_protection;
++    uint32_t ack_enabled;
++    uint32_t reserved_v3;
++    uint32_t tx_ampdu_spacing;
++    uint32_t tx_ampdu_max_size;
++    uint32_t sp_length;
++    uint32_t uapsd_acs;
++    struct iwx_mld_he_pkt_ext_v2 pkt_ext;
++    uint32_t htc_flags;
++    uint8_t use_ldpc_x2_cw;
++    uint8_t use_icf;
++    uint8_t dps_pad_time;
++    uint8_t dps_trans_delay;
++    uint8_t dps_enabled;
++    uint8_t mic_prep_pad_delay;
++    uint8_t mic_compute_pad_delay;
++    uint8_t nmi_sta_id;
++    uint8_t ndi_local_address[IEEE80211_ADDR_LEN];
++    uint8_t reserved_tail[2];
++} __packed;
++
++static_assert(sizeof(iwx_be211_sta_config_v3) == 112, "STA_CONFIG v3 size");
++static_assert(offsetof(iwx_be211_sta_config_v3, peer_link_address) == 16, "STA_CONFIG v3 link address offset");
++static_assert(offsetof(iwx_be211_sta_config_v3, mfp) == 36, "STA_CONFIG v3 MFP offset");
++static_assert(offsetof(iwx_be211_sta_config_v3, dps_enabled) == 100, "STA_CONFIG v3 DPS offset");
++static_assert(sizeof(iwx_mld_mvm_remove_sta_cmd) == 4, "STA_REMOVE v1 size");
++
++constexpr unsigned be211_echo_budget = 4;
++constexpr unsigned be211_probe_slots = 128;
++
++struct be211_bsd_tx_ring {
++    uint16_t read;
++    uint16_t write;
++
++    unsigned pending() const { return static_cast<uint16_t>(write - read); }
++    unsigned index() const { return write & (be211_probe_slots - 1); }
++
++    unsigned complete(uint16_t next)
++    {
++        const unsigned released = static_cast<uint16_t>(next - read);
++        if (!released || released > pending())
++            return 0;
++        read = next;
++        return released;
++    }
++};
++
++struct be211_echo_request {
++    uint8_t addresses[8];
++    uint8_t identifier_sequence[4];
++    bool pending;
++};
++
++// This state lives on the joining thread's stack. Only gated RX and TX handlers
++// dereference it while the join is sleeping with the association active.
++struct be211_bsd_bridge {
++    struct iwx_dma_info descriptors;
++    struct iwx_dma_info byte_counts;
++    struct iwx_dma_info command;
++    uint32_t rate_flags;
++    uint32_t xid;
++    uint16_t queue;
++    be211_bsd_tx_ring ring;
++    unsigned tx;
++    unsigned reclaimed;
++    unsigned max_pending;
++    unsigned full_events;
++    unsigned invalid_completions;
++    unsigned failed_completions;
++    bool tx_waiting;
++    unsigned dequeued;
++    unsigned rx;
++    unsigned echo_tx;
++    unsigned echo_rx;
++    unsigned web_tx;
++    unsigned web_rx;
++    uint8_t lease_address[4];
++    be211_echo_request echoes[be211_echo_budget];
++    bool xid_valid;
++    bool ack_forwarded;
++    bool mac_mismatch;
++};
++
++namespace {
++constexpr int be211_auth_tx_complete = 1;
++constexpr int be211_auth_rx_complete = 2;
++constexpr int be211_session_reported = 1;
++constexpr int be211_session_active = 2;
++constexpr unsigned be211_session_link = 0;
++constexpr unsigned be211_mgmt_command_stride = 128;
++constexpr unsigned be211_probe_body_offset = 64;
++constexpr size_t be211_probe_bc_bytes = 4096 * sizeof(uint16_t);
++constexpr uint32_t be211_probe_station_mask = 1;
++constexpr uint8_t be211_snap_prefix[] = {0xaa, 0xaa, 0x03, 0, 0, 0};
++constexpr unsigned be211_snap_size = sizeof(be211_snap_prefix) + sizeof(uint16_t);
++constexpr unsigned be211_bsd_slot_bytes = 2048;
++constexpr unsigned be211_web_trace_limit = 76;
++constexpr uint8_t be211_dhcp_cookie[] = {99, 130, 83, 99};
++constexpr unsigned be211_bootp_fixed = 236;
++constexpr unsigned be211_dhcp_options = be211_bootp_fixed + sizeof(be211_dhcp_cookie);
++constexpr unsigned be211_udp_header = 8;
++enum : uint8_t {
++    be211_dhcp_discover = 1,
++    be211_dhcp_offer = 2,
++    be211_dhcp_request = 3,
++    be211_dhcp_ack = 5,
++    be211_dhcp_nak = 6,
++};
++
++// The transfer buffer split is shared by the management and data probes.
++struct be211_probe_tx_command {
++    struct iwx_cmd_header header;
++    struct iwx_tx_cmd_gen3 tx;
++    struct ieee80211_frame frame;
++} __packed;
++static_assert(sizeof(iwx_tx_cmd_gen3) == 28 && sizeof(be211_probe_tx_command) == 56,
++              "Core 106 TX command layout");
++
++void be211_fill_probe_tfd(iwx_tfh_tfd &descriptor, uint64_t address, unsigned body_size)
++{
++    descriptor.num_tbs = htole16(3);
++    descriptor.tbs[0].tb_len = htole16(IWX_FIRST_TB_SIZE);
++    descriptor.tbs[1].tb_len = htole16(sizeof(be211_probe_tx_command) - IWX_FIRST_TB_SIZE);
++    descriptor.tbs[2].tb_len = htole16(body_size);
++    const uint64_t addresses[] = { htole64(address), htole64(address + IWX_FIRST_TB_SIZE),
++                                   htole64(address + be211_probe_body_offset) };
++    for (unsigned i = 0; i < nitems(addresses); ++i)
++        memcpy(&descriptor.tbs[i].addr, &addresses[i], sizeof(addresses[i]));
++}
++
++unsigned be211_get_be16(const uint8_t *bytes)
++{
++    return (bytes[0] << 8) | bytes[1];
++}
++
++// Validate the IPv4 envelope before reading the ICMP echo header.
++const uint8_t *be211_echo_header(const uint8_t *ip, size_t length, uint8_t type)
++{
++    constexpr unsigned ipv4_min_header = 20;
++    constexpr unsigned icmp_echo_header = 8;
++    if (length < ipv4_min_header || ip[0] >> 4 != 4 || ip[9] != 1 ||
++        (be211_get_be16(ip + 6) & 0x3fff))
++        return nullptr;
++    const unsigned header = (ip[0] & 0xf) * 4;
++    const unsigned size = be211_get_be16(ip + 2);
++    if (header < ipv4_min_header || size > length || size < header + icmp_echo_header)
++        return nullptr;
++    const auto *icmp = ip + header;
++    return icmp[0] == type && icmp[1] == 0 ? icmp : nullptr;
++}
++
++// Admit one small IPv4 web test on the address assigned to this window.
++unsigned be211_web_port(const uint8_t *ip, size_t length, bool outgoing, const uint8_t *lease)
++{
++    if (length < 20 || ip[0] >> 4 != 4 || (be211_get_be16(ip + 6) & 0x3fff) ||
++        !(lease[0] | lease[1] | lease[2] | lease[3]) ||
++        memcmp(ip + (outgoing ? 12 : 16), lease, 4))
++        return 0;
++    const unsigned header = (ip[0] & 0xf) * 4;
++    const unsigned size = be211_get_be16(ip + 2);
++    if (header < 20 || size > length || size < header + 8)
++        return 0;
++    const auto *transport = ip + header;
++    const unsigned port = be211_get_be16(transport + (outgoing ? 2 : 0));
++    const unsigned transport_size = size - header;
++    if (ip[9] == 17)
++        return port == 53 && transport_size == be211_get_be16(transport + 4) ? port : 0;
++    if (ip[9] != 6 || transport_size < 20)
++        return 0;
++    const unsigned tcp_header = (transport[12] >> 4) * 4;
++    return tcp_header >= 20 && tcp_header <= transport_size && (port == 53 || port == 443) ? port : 0;
++}
++
++// Return a DHCP message type and keep the host client's transaction ID intact.
++uint8_t be211_dhcp_type(const uint8_t *ip, size_t length, bool outgoing, const uint8_t *mac,
++                        uint32_t *xid, uint8_t *offered_address = nullptr)
++{
++    if (length < 20 || ip[0] >> 4 != 4 || ip[9] != 17 ||
++        (be211_get_be16(ip + 6) & 0x3fff))
++        return 0;
++    const unsigned ip_header = (ip[0] & 0xf) * 4;
++    const unsigned ip_size = be211_get_be16(ip + 2);
++    if (ip_header < 20 || ip_size > length ||
++        ip_size < ip_header + be211_udp_header + be211_dhcp_options)
++        return 0;
++    const auto *udp = ip + ip_header;
++    const unsigned udp_size = be211_get_be16(udp + 4);
++    if (be211_get_be16(udp) != (outgoing ? 68U : 67U) ||
++        be211_get_be16(udp + 2) != (outgoing ? 67U : 68U) ||
++        udp_size < be211_udp_header + be211_dhcp_options || udp_size > ip_size - ip_header)
++        return 0;
++    const auto *dhcp = udp + be211_udp_header;
++    if (dhcp[0] != (outgoing ? 1 : 2) || dhcp[1] != 1 || dhcp[2] != IEEE80211_ADDR_LEN ||
++        !IEEE80211_ADDR_EQ(dhcp + 28, mac) ||
++        memcmp(dhcp + be211_bootp_fixed, be211_dhcp_cookie, sizeof(be211_dhcp_cookie)))
++        return 0;
++    const size_t options_end = udp_size - be211_udp_header;
++    uint8_t type = 0;
++    for (size_t pos = be211_dhcp_options; pos < options_end;) {
++        const unsigned option = dhcp[pos++];
++        if (option == 255) {
++            memcpy(xid, dhcp + 4, sizeof(*xid));
++            if (offered_address && type == be211_dhcp_ack)
++                memcpy(offered_address, dhcp + 16, 4);
++            return type;
++        }
++        if (!option)
++            continue;
++        if (pos == options_end || dhcp[pos] > options_end - pos - 1)
++            return 0;
++        const unsigned size = dhcp[pos++];
++        if (option == 53 && size == 1)
++            type = dhcp[pos];
++        pos += size;
++    }
++    return 0;
++}
++
++iwx_be211_mac_context_v4 be211_mac_context(const iwx_softc *sc, uint32_t action, uint16_t aid)
++{
++    struct iwx_be211_mac_context_v4 mac = {};
++    mac.action = htole32(action);
++    mac.mac_type = htole32(IWX_FW_MAC_TYPE_BSS_STA);
++    IEEE80211_ADDR_COPY(mac.local_address, sc->sc_nvm.hw_addr);
++    mac.filter_flags = htole32(IWX_MLD_MAC_CFG_FILTER_ACCEPT_GRP |
++                               IWX_MLD_MAC_CFG_FILTER_ACCEPT_BEACON);
++    mac.client.is_assoc = aid != 0;
++    mac.client.assoc_id = htole16(aid);
++    return mac;
++}
++
++iwx_be211_sta_config_v3 be211_peer_context(const iwx_softc *sc, uint16_t aid)
++{
++    struct iwx_be211_sta_config_v3 peer = {};
++    peer.link_mask = htole32(1U << be211_session_link);
++    peer.station_type = htole32(IWX_STA_LINK);
++    peer.assoc_id = htole32(aid);
++    peer.mfp = htole32(1); // Until authorized.
++    IEEE80211_ADDR_COPY(peer.peer_mld_address, sc->sc_be211_peer_bssid);
++    IEEE80211_ADDR_COPY(peer.peer_link_address, sc->sc_be211_peer_bssid);
++    return peer;
++}
++constexpr unsigned be211_auth_raw_log_limit = 32;
++
++
++}
++
++int ItlIwx::iwx_be211_auth_probe(struct iwx_softc *sc, uint16_t queue,
++                                uint16_t write_pointer, unsigned slots,
++                                iwx_dma_info &descriptors, iwx_dma_info &byte_counts,
++                                iwx_dma_info &command)
++{
++    const unsigned tx_version = iwx_lookup_cmd_ver(sc, IWX_LEGACY_GROUP, IWX_TX_CMD);
++    const unsigned reply_version = iwx_lookup_notif_ver(sc, IWX_LEGACY_GROUP, IWX_TX_CMD);
++    IOLog("BE211 probe: authentication TX versions command=%u response=%u\n",
++          tx_version, reply_version);
++    if (tx_version != 12 || reply_version != 9 || queue >= 32)
++        return ENOTSUP;
++    if ((sc->sc_flags & IWX_FLAG_RFKILL) ||
++        sc->sc_be211_peer_channel != sc->sc_be211_auth_channel ||
++        !IEEE80211_ADDR_EQ(sc->sc_be211_peer_bssid, sc->sc_be211_auth_bssid))
++        return EPERM;
++
++    const auto protection_cmd = IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_SESSION_PROTECTION_CMD);
++    const unsigned protection_version = iwx_lookup_cmd_ver(sc, IWX_MAC_CONF_GROUP,
++                                                           IWX_SESSION_PROTECTION_CMD);
++    const unsigned protection_notif_version = iwx_lookup_notif_ver(sc, IWX_MAC_CONF_GROUP,
++                                                                   IWX_SESSION_PROTECTION_NOTIF);
++    IOLog("BE211 probe: session protection versions command=%u notification=%u\n",
++          protection_version, protection_notif_version);
++    if (protection_version != 2 || protection_notif_version != 3)
++        return ENOTSUP;
++
++    static_assert(sizeof(iwx_session_prot_cmd) == 24 && sizeof(iwx_session_prot_notif) == 16,
++                  "Core 106 session protection layouts");
++    constexpr unsigned protection_duration_tu = 900 * 1000 / 1024;
++    constexpr unsigned protection_start_timeout_ms = 350;
++    struct iwx_session_prot_cmd protection = {};
++    protection.id_and_color = htole32(be211_session_link);
++    protection.action = htole32(IWX_FW_CTXT_ACTION_ADD);
++    protection.conf_id = htole32(IWX_SESSION_PROTECT_CONF_ASSOC);
++    protection.duration_tu = htole32(protection_duration_tu);
++
++    const int generation = sc->sc_generation;
++    sc->sc_be211_session_events = 0;
++    sc->sc_be211_session_pending = true;
++    int err = iwx_send_cmd_pdu(sc, protection_cmd, 0, sizeof(protection), &protection);
++    IOLog("BE211 probe: session protection add link=%u duration=%u TU result=%d\n",
++          be211_session_link, protection_duration_tu, err);
++    if (err) {
++        sc->sc_be211_session_pending = false;
++        return err;
++    }
++
++    const auto remove_protection = [&]() {
++        int remove_err = ENXIO;
++        if (generation == sc->sc_generation) {
++            protection.action = htole32(IWX_FW_CTXT_ACTION_REMOVE);
++            protection.duration_tu = 0;
++            remove_err = iwx_send_cmd_pdu(sc, protection_cmd, 0, sizeof(protection), &protection);
++        }
++        sc->sc_be211_session_pending = false;
++        IOLog("BE211 probe: session protection remove result=%d\n", remove_err);
++        return remove_err;
++    };
++
++    err = iwx_wait_notification(sc, &sc->sc_be211_session_events, be211_session_reported,
++                                protection_start_timeout_ms);
++    if (!err && !(sc->sc_be211_session_events & be211_session_active))
++        err = EIO;
++    if (!err && (sc->sc_flags & IWX_FLAG_RFKILL))
++        err = EPERM;
++    IOLog("BE211 probe: session protection start wait events=0x%x result=%d\n",
++          sc->sc_be211_session_events, err);
++    if (err) {
++        remove_protection();
++        return err;
++    }
++
++    const auto submit = [&](const char *phase_name, uint8_t subtype, uint16_t pointer,
++                            unsigned command_offset, const uint8_t *body, size_t body_size) {
++        if (generation != sc->sc_generation)
++            return ENXIO;
++        if (!(sc->sc_be211_session_events & be211_session_active) ||
++            (sc->sc_flags & IWX_FLAG_RFKILL)) {
++            IOLog("BE211 probe: %s skipped, protected airtime unavailable\n", phase_name);
++            return EPERM;
++        }
++        if (body_size > be211_mgmt_command_stride - be211_probe_body_offset)
++            return EINVAL;
++        auto *command_buffer = static_cast<uint8_t *>(command.vaddr) + command_offset;
++        const uint64_t command_address = command.paddr + command_offset;
++        const unsigned frame_size = sizeof(ieee80211_frame) + body_size;
++        const unsigned index = pointer & (slots - 1);
++        auto *packet = reinterpret_cast<be211_probe_tx_command *>(command_buffer);
++        packet->header.cmd = IWX_TX_CMD;
++        packet->header.idx = index;
++        packet->header.qid = queue;
++        packet->tx.len = htole16(frame_size);
++        // The frame uses the AP peer station. Let firmware select its rate.
++        packet->tx.flags = htole16(IWX_TX_FLAGS_HIGH_PRI | IWX_TX_FLAGS_ENCRYPT_DIS);
++        packet->tx.offload_assist = htole32(itlTxOffloadHeader(sizeof(packet->frame), false));
++        packet->tx.rate_n_flags = 0;
++        packet->frame.i_fc[0] = subtype;
++        IEEE80211_ADDR_COPY(packet->frame.i_addr1, sc->sc_be211_auth_bssid);
++        IEEE80211_ADDR_COPY(packet->frame.i_addr2, sc->sc_nvm.hw_addr);
++        IEEE80211_ADDR_COPY(packet->frame.i_addr3, sc->sc_be211_auth_bssid);
++        memcpy(command_buffer + be211_probe_body_offset, body, body_size);
++        auto &descriptor = static_cast<iwx_tfh_tfd *>(descriptors.vaddr)[index];
++        be211_fill_probe_tfd(descriptor, command_address, body_size);
++        static_cast<uint16_t *>(byte_counts.vaddr)[index] = htole16(frame_size);
++
++        sc->sc_be211_auth_queue = queue;
++        sc->sc_be211_mgmt_index = index;
++        sc->sc_be211_mgmt_response_subtype = subtype == IEEE80211_FC0_SUBTYPE_AUTH ?
++            IEEE80211_FC0_SUBTYPE_AUTH : IEEE80211_FC0_SUBTYPE_ASSOC_RESP;
++        sc->sc_be211_auth_events = 0;
++        sc->sc_be211_auth_raw_notifications = 0;
++        sc->sc_be211_auth_raw_mpdus = 0;
++        sc->sc_be211_auth_pending = true;
++        const unsigned next_pointer = uint16_t(pointer + 1);
++        const uint32_t doorbell = (uint32_t(queue) << 16) | next_pointer;
++        const auto log_rx_ring = [&](const char *phase) {
++            if (generation != sc->sc_generation || !sc->rxq.stat) {
++                IOLog("BE211 probe: %s RX ring %s unavailable after reset\n", phase_name, phase);
++                return;
++            }
++            const unsigned closed = le16toh(*static_cast<volatile uint16_t *>(sc->rxq.stat)) &
++                                    (IWX_RX_MQ_RING_COUNT - 1);
++            IOLog("BE211 probe: %s RX ring %s next=%u closed=%u\n",
++                  phase_name, phase, static_cast<unsigned>(sc->rxq.cur), closed);
++        };
++        IOLog("BE211 probe: %s submit qid=%u index=%u channel=%d flags=0x%x firmware rate\n",
++              phase_name, static_cast<unsigned>(queue), index, sc->sc_be211_auth_channel,
++              static_cast<unsigned>(le16toh(packet->tx.flags)));
++        IOLog("BE211 probe: %s TX write pointer old=%u next=%u doorbell=0x%x bc=%u tbs=%u\n",
++              phase_name, static_cast<unsigned>(pointer), next_pointer, doorbell, frame_size, 3U);
++        log_rx_ring("before");
++        OSSynchronizeIO();
++        IWX_WRITE(sc, IWX_HBUS_TARG_WRPTR, doorbell);
++        const int wait_err = iwx_wait_notification(sc, &sc->sc_be211_auth_events,
++                                    be211_auth_tx_complete | be211_auth_rx_complete, 1200);
++        sc->sc_be211_auth_pending = false;
++        log_rx_ring("after");
++        IOLog("BE211 probe: %s raw summary notifications=%u mpdus=%u\n",
++              phase_name, sc->sc_be211_auth_raw_notifications, sc->sc_be211_auth_raw_mpdus);
++        IOLog("BE211 probe: %s wait events=0x%x result=%d\n",
++              phase_name, sc->sc_be211_auth_events, wait_err);
++        if (wait_err)
++            return wait_err;
++        return sc->sc_be211_auth_rx_status == 0 &&
++               sc->sc_be211_auth_tx_status == IWX_TX_STATUS_SUCCESS ? 0 : EIO;
++    };
++
++    const uint8_t auth_body[] = {0, 0, 1, 0, 0, 0}; // Open System, transaction 1.
++    err = submit("authentication", IEEE80211_FC0_SUBTYPE_AUTH, write_pointer, 0,
++                 auth_body, sizeof(auth_body));
++    if (!err && sc->sc_be211_auth_ssid_len) {
++        // Open ESS, listen interval one beacon, SSID and the AP's legacy rates.
++        uint8_t assoc_body[4 + 2 + IEEE80211_NWID_LEN + 4 + 12] = {1, 0, 1, 0};
++        unsigned length = 4;
++        assoc_body[length++] = IEEE80211_ELEMID_SSID;
++        assoc_body[length++] = sc->sc_be211_auth_ssid_len;
++        memcpy(assoc_body + length, sc->sc_be211_auth_ssid, sc->sc_be211_auth_ssid_len);
++        length += sc->sc_be211_auth_ssid_len;
++        const unsigned rate_count = sc->sc_be211_assoc_rate_count;
++        const unsigned first_rates = MIN(rate_count, 8U);
++        assoc_body[length++] = IEEE80211_ELEMID_RATES;
++        assoc_body[length++] = first_rates;
++        memcpy(assoc_body + length, sc->sc_be211_assoc_rates, first_rates);
++        length += first_rates;
++        if (rate_count > first_rates) {
++            const unsigned extended_rates = rate_count - first_rates;
++            assoc_body[length++] = IEEE80211_ELEMID_XRATES;
++            assoc_body[length++] = extended_rates;
++            memcpy(assoc_body + length, sc->sc_be211_assoc_rates + first_rates, extended_rates);
++            length += extended_rates;
++        }
++        sc->sc_be211_assoc_aid = 0;
++        err = submit("association", IEEE80211_FC0_SUBTYPE_ASSOC_REQ, uint16_t(write_pointer + 1),
++                     be211_mgmt_command_stride, assoc_body, length);
++        IOLog("BE211 probe: association test result=%d\n", err);
++    }
++    bool mac_associated = false;
++    const auto mac_cmd = IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_MLD_MAC_CONFIG_CMD);
++    if (!err && sc->sc_be211_auth_ssid_len) {
++        const uint16_t aid = sc->sc_be211_assoc_aid;
++        if (!aid || aid > 2007) {
++            IOLog("BE211 probe: association handoff invalid aid=%u\n", static_cast<unsigned>(aid));
++            err = EIO;
++        } else {
++            auto peer = be211_peer_context(sc, aid);
++            const auto sta_cmd = IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_MLD_STA_CONFIG_CMD);
++            err = iwx_send_cmd_pdu(sc, sta_cmd, 0, sizeof(peer), &peer);
++            IOLog("BE211 probe: STA_CONFIG v3 associated aid=%u result=%d\n",
++                  static_cast<unsigned>(aid), err);
++            if (!err) {
++                auto mac = be211_mac_context(sc, IWX_FW_CTXT_ACTION_MODIFY, aid);
++                err = iwx_send_cmd_pdu(sc, mac_cmd, 0, sizeof(mac), &mac);
++                IOLog("BE211 probe: MAC_CONFIG v4 associated aid=%u result=%d\n",
++                      static_cast<unsigned>(aid), err);
++                mac_associated = !err;
++            }
++        }
++    }
++    // Firmware can end the session automatically when MAC_CONFIG marks it associated.
++    int remove_err = 0;
++    if (mac_associated && sc->sc_be211_session_events == be211_session_reported) {
++        sc->sc_be211_session_pending = false;
++        IOLog("BE211 probe: session protection ended during association handoff\n");
++    } else {
++        remove_err = remove_protection();
++    }
++    if (mac_associated && generation == sc->sc_generation) {
++        sc->sc_be211_post_assoc_beacon = 0;
++        sc->sc_be211_peer_beacon_size = 0;
++        sc->sc_be211_post_assoc_observing = true;
++        if (!remove_err) {
++            const int beacon_err = iwx_wait_notification(sc, &sc->sc_be211_post_assoc_beacon, 1, 450);
++            IOLog("BE211 probe: post-association beacon wait result=%d\n", beacon_err);
++            if (!beacon_err) {
++                sc->sc_be211_runtime_dhcp_result = iwx_be211_dhcp_probe(sc);
++                IOLog("BE211 probe: DHCP data test result=%d\n", sc->sc_be211_runtime_dhcp_result);
++            } else {
++                IOLog("BE211 probe: DHCP skipped after beacon wait result=%d\n", beacon_err);
++            }
++        } else {
++            IOLog("BE211 probe: DHCP skipped after protection removal result=%d\n", remove_err);
++        }
++        if (generation == sc->sc_generation) {
++            auto mac = be211_mac_context(sc, IWX_FW_CTXT_ACTION_MODIFY, 0);
++            err = iwx_send_cmd_pdu(sc, mac_cmd, 0, sizeof(mac), &mac);
++            IOLog("BE211 probe: MAC_CONFIG v4 clear association result=%d\n", err);
++        } else {
++            err = ENXIO;
++        }
++        sc->sc_be211_post_assoc_observing = false;
++    }
++    return err ? err : remove_err;
++}
++
++bool ItlIwx::iwx_be211_publish_association(struct iwx_softc *sc)
++{
++    if (!sc->sc_be211_association_observer)
++        return true; // Legacy requests still use the diagnostic.
++#ifdef AIRPORT_WCL
++    constexpr size_t fixed = sizeof(ieee80211_frame) + 12;
++    const auto length = sc->sc_be211_peer_beacon_size;
++    if (length < fixed + 2)
++        return false;
++    auto *beacon = static_cast<uint8_t *>(IOMalloc(length));
++    if (!beacon)
++        return false;
++    memcpy(beacon, sc->sc_be211_peer_beacon, length);
++    ieee80211_node node = {};
++    IEEE80211_ADDR_COPY(node.ni_bssid, sc->sc_be211_auth_bssid);
++    node.ni_chan = &sc->sc_ic.ic_channels[sc->sc_be211_auth_channel];
++    node.ni_chw = IEEE80211_CHAN_WIDTH_20;
++    node.ni_rssi = sc->sc_be211_peer_beacon_rssi;
++    node.ni_intval = beacon[fixed - 4] | (beacon[fixed - 3] << 8);
++    node.ni_capinfo = beacon[fixed - 2] | (beacon[fixed - 1] << 8);
++    node.ni_esslen = sc->sc_be211_auth_ssid_len;
++    memcpy(node.ni_essid, sc->sc_be211_auth_ssid, node.ni_esslen);
++    const ieee80211_beacon_event event = {&node, beacon + fixed, length - fixed, beacon, length};
++    const bool published = sc->sc_be211_association_observer(sc->sc_be211_association_context, event);
++    IOFree(beacon, length);
++    return published;
++#else
++    return false;
++#endif
++}
++
++bool ItlIwx::copyBE211PeerBeacon(void *out, size_t capacity) const
++{
++    const uint32_t length = com.sc_be211_peer_beacon_size;
++    if (!out || !be211BSDActive() || !length || capacity < sizeof(length) + length)
++        return false;
++    bzero(out, capacity);
++    memcpy(out, &length, sizeof(length));
++    memcpy(static_cast<uint8_t *>(out) + sizeof(length), com.sc_be211_peer_beacon, length);
++    return true;
++}
++
++bool ItlIwx::copyBE211AssociationRates(ieee80211_rateset &rates) const
++{
++    // The WCL query runs under the controller gate, as do join and teardown.
++    const unsigned count = com.sc_be211_assoc_rate_count;
++    if (!be211BSDActive() || !com.sc_be211_assoc_aid || !count ||
++        count > sizeof(com.sc_be211_assoc_rates) || count > sizeof(rates.rs_rates))
++        return false;
++    rates = {};
++    rates.rs_nrates = count;
++    memcpy(rates.rs_rates, com.sc_be211_assoc_rates, count);
++    return true;
++}
++
++int ItlIwx::iwx_be211_dhcp_probe(struct iwx_softc *sc)
++{
++#ifdef AIRPORT_VTD
++    if (sc->sc_flags & IWX_FLAG_RFKILL)
++        return EPERM;
++    // Fix the rate for this experiment so the DHCP frame bypasses peer TLC.
++    unsigned basic_rate = 0;
++    unsigned lowest_rate = 0;
++    for (unsigned i = 0; i < sc->sc_be211_assoc_rate_count; ++i) {
++        const unsigned advertised = sc->sc_be211_assoc_rates[i];
++        const unsigned rate = advertised & IEEE80211_RATE_VAL;
++        if (!lowest_rate || rate < lowest_rate)
++            lowest_rate = rate;
++        if ((advertised & IEEE80211_RATE_BASIC) && (!basic_rate || rate < basic_rate))
++            basic_rate = rate;
++    }
++    const unsigned rate = basic_rate ? basic_rate : lowest_rate;
++    const unsigned antennas = iwx_fw_valid_tx_ant(sc) & sc->sc_nvm.valid_tx_ant & 0x7;
++    const unsigned ridx = iwx_rval2ridx(rate);
++    if (!rate || ridx >= nitems(iwx_rates) || !antennas) {
++        IOLog("BE211 probe: DHCP fixed rate unavailable rate500k=%u antennas=0x%x\n",
++              rate, antennas);
++        return ENOTSUP;
++    }
++    const unsigned antenna = antennas & -antennas;
++    const unsigned modulation = IWX_RIDX_IS_CCK(ridx) ? IWX_RATE_MCS_CCK_MSK : IWX_RATE_MCS_LEGACY_OFDM_MSK;
++    const unsigned rate_code = IWX_RIDX_IS_CCK(ridx) ? ridx : iwx_rate2idx(rate);
++    const uint32_t rate_flags = modulation | rate_code | (antenna << IWX_RATE_MCS_ANT_POS);
++
++    auto *ifp = &sc->sc_ic.ic_if;
++    if (!ifp->controller || !ifp->iface || !ifp->if_snd.queue)
++        return ENXIO;
++
++    constexpr unsigned data_tid = 0;
++    be211_bsd_bridge bridge = {};
++    const bool allocated =
++        !iwx_dma_contig_alloc(sc->sc_dmat, &bridge.descriptors,
++                              be211_probe_slots * sizeof(iwx_tfh_tfd), 256) &&
++        !iwx_dma_contig_alloc(sc->sc_dmat, &bridge.byte_counts, be211_probe_bc_bytes, 256) &&
++        !iwx_dma_contig_alloc(sc->sc_dmat, &bridge.command,
++                              be211_probe_slots * be211_bsd_slot_bytes, be211_bsd_slot_bytes);
++    int err = ENOMEM;
++    if (allocated) {
++        const int generation = sc->sc_generation;
++        bridge.queue = IWX_INVALID_QUEUE;
++        bridge.rate_flags = rate_flags;
++        err = iwx_mld_queue_cmd(sc, be211_probe_station_mask, data_tid, 0, be211_probe_slots,
++                                bridge.descriptors.paddr, bridge.byte_counts.paddr,
++                                &bridge.queue, &bridge.ring.write);
++        bridge.ring.read = bridge.ring.write;
++        IOLog("BE211 probe: BSD queue add qid=%u wp=%u result=%d\n",
++              bridge.queue, bridge.ring.write, err);
++        const bool queue_added = !err;
++        if (!err && (bridge.queue >= 32 || bridge.queue == sc->sc_be211_auth_queue))
++            err = ENOTSUP;
++        if (generation != sc->sc_generation)
++            err = ENXIO;
++        if (!err && (sc->sc_flags & IWX_FLAG_RFKILL))
++            err = EPERM;
++        if (!err) {
++            ifq_flush(&ifp->if_snd);
++            sc->sc_be211_bsd = &bridge;
++            sc->sc_be211_bsd_stop = 0;
++            __atomic_store_n(&sc->sc_be211_bsd_active, true, __ATOMIC_RELEASE);
++            int wait = ECANCELED;
++            if (iwx_be211_publish_association(sc) && !sc->sc_be211_join_cancelled &&
++                generation == sc->sc_generation) {
++                ieee80211_set_link_state(&sc->sc_ic, LINK_STATE_UP);
++                IOLog("BE211 probe: BSD packet window started duration=until-disconnect rate500k=%u\n",
++                      rate);
++                // Poll only for faults that may not signal the stop event. A poll
++                // timeout leaves the association and firmware queues running.
++                constexpr unsigned poll_ms = 5000;
++                unsigned polls = 0;
++                do {
++                    if (sc->sc_flags & IWX_FLAG_RFKILL) {
++                        wait = EPERM;
++                        break;
++                    }
++                    if (sc->sc_flags & (IWX_FLAG_HW_ERR | IWX_FLAG_SHUTDOWN)) {
++                        wait = EIO;
++                        break;
++                    }
++                    wait = iwx_wait_notification(sc, &sc->sc_be211_bsd_stop, 1, poll_ms);
++                    if (wait == EWOULDBLOCK && ++polls % 12 == 0)
++                        IOLog("BE211 probe: BSD link heartbeat tx=%u rx=%u reclaimed=%u pending=%u invalid_completions=%u failed_completions=%u\n",
++                              bridge.tx, bridge.rx, bridge.reclaimed, bridge.ring.pending(),
++                              bridge.invalid_completions, bridge.failed_completions);
++                } while (wait == EWOULDBLOCK);
++            }
++            __atomic_store_n(&sc->sc_be211_bsd_active, false, __ATOMIC_RELEASE);
++            sc->sc_be211_bsd = nullptr;
++            ieee80211_set_link_state(&sc->sc_ic, LINK_STATE_DOWN);
++            if (sc->sc_be211_join_cancelled)
++                err = ECANCELED;
++            else
++                err = wait ? wait : ECONNRESET;
++            IOLog("BE211 probe: BSD packet window complete tx=%u rx=%u ack_forwarded=%u result=%d dequeued=%u wait=%d cancelled=%u\n",
++                  bridge.tx, bridge.rx, static_cast<unsigned>(bridge.ack_forwarded), err, bridge.dequeued,
++                  wait, static_cast<unsigned>(sc->sc_be211_join_cancelled));
++            IOLog("BE211 probe: BSD ICMP window requests=%u replies=%u\n",
++                  bridge.echo_tx, bridge.echo_rx);
++            IOLog("BE211 probe: BSD web window tx=%u rx=%u\n", bridge.web_tx, bridge.web_rx);
++            IOLog("BE211 probe: BSD TX ring tx=%u reclaimed=%u pending=%u peak=%u full_events=%u invalid_completions=%u failed_completions=%u\n",
++                  bridge.tx, bridge.reclaimed, bridge.ring.pending(), bridge.max_pending,
++                  bridge.full_events, bridge.invalid_completions, bridge.failed_completions);
++        }
++        if (queue_added && generation == sc->sc_generation) {
++            const int cleanup = iwx_mld_queue_cmd(sc, be211_probe_station_mask, data_tid,
++                                                 1, 0, 0, 0, nullptr, nullptr);
++            IOLog("BE211 probe: BSD queue remove result=%d\n", cleanup);
++            if (!err)
++                err = cleanup;
++        }
++        // The firmware may still reference submitted buffers until the device stops.
++        sc->sc_dmat->deferRecycling();
++    }
++    iwx_dma_contig_free(&bridge.command);
++    iwx_dma_contig_free(&bridge.byte_counts);
++    iwx_dma_contig_free(&bridge.descriptors);
++    return err;
++#else
++    return ENOTSUP;
++#endif
++}
++
++void ItlIwx::iwx_be211_bsd_output(struct iwx_softc *sc)
++{
++    auto &bridge = *sc->sc_be211_bsd;
++    auto *ifp = &sc->sc_ic.ic_if;
++    while (!sc->sc_be211_bsd_stop &&
++           !(sc->sc_flags & (IWX_FLAG_RFKILL | IWX_FLAG_HW_ERR | IWX_FLAG_SHUTDOWN))) {
++        // Keep one slot empty and leave pending packets in the BSD queue.
++        if (bridge.ring.pending() >= be211_probe_slots - 1) {
++            if (!bridge.tx_waiting && !ifq_empty(&ifp->if_snd)) {
++                bridge.tx_waiting = true;
++                ++bridge.full_events;
++            }
++            break;
++        }
++        mbuf_t m = ifq_dequeue(&ifp->if_snd);
++        if (!m)
++            break;
++        ++bridge.dequeued;
++        const size_t length = mbuf_pkthdr_len(m);
++        ether_header ethernet = {};
++        if (length <= sizeof(ethernet) || length > sizeof(ethernet) + ETHERMTU ||
++            mbuf_copydata(m, 0, sizeof(ethernet), &ethernet)) {
++            mbuf_freem(m);
++            continue;
++        }
++        if (!IEEE80211_ADDR_EQ(ethernet.ether_shost, sc->sc_nvm.hw_addr)) {
++            if (!bridge.mac_mismatch) {
++                bridge.mac_mismatch = true;
++                IOLog("BE211 probe: BSD TX source MAC differs from association MAC\n");
++            }
++            mbuf_freem(m);
++            continue;
++        }
++        const unsigned protocol = ntohs(ethernet.ether_type);
++        if (protocol != ETHERTYPE_IP && protocol != ETHERTYPE_ARP) {
++            mbuf_freem(m);
++            continue;
++        }
++        const unsigned index = bridge.ring.index();
++        const unsigned command_offset = index * be211_bsd_slot_bytes;
++        auto *buffer = static_cast<uint8_t *>(bridge.command.vaddr) + command_offset;
++        bzero(buffer, be211_bsd_slot_bytes);
++        auto *snap = buffer + be211_probe_body_offset;
++        auto *payload = snap + be211_snap_size;
++        const unsigned payload_size = length - sizeof(ethernet);
++        static_assert(be211_probe_body_offset + be211_snap_size + ETHERMTU <= be211_bsd_slot_bytes,
++                      "BSD TX command buffer");
++        const auto copy_error = mbuf_copydata(m, sizeof(ethernet), payload_size, payload);
++        mbuf_freem(m);
++        if (copy_error)
++            continue;
++
++        uint8_t dhcp_type = 0;
++        const uint8_t *echo = nullptr;
++        if (protocol == ETHERTYPE_IP && bridge.ack_forwarded &&
++            bridge.echo_tx < be211_echo_budget && !(ethernet.ether_dhost[0] & 1))
++            echo = be211_echo_header(payload, payload_size, 8);
++
++        const unsigned web_port = protocol == ETHERTYPE_IP && bridge.ack_forwarded &&
++            !(ethernet.ether_dhost[0] & 1) ?
++            be211_web_port(payload, payload_size, true, bridge.lease_address) : 0;
++        if (web_port) {
++            ++bridge.web_tx;
++        } else if (echo) {
++            auto &request = bridge.echoes[bridge.echo_tx++];
++            memcpy(request.addresses, payload + 12, sizeof(request.addresses));
++            memcpy(request.identifier_sequence, echo + 4, sizeof(request.identifier_sequence));
++            request.pending = true;
++        } else {
++            if (protocol == ETHERTYPE_IP) {
++                uint32_t xid = 0;
++                dhcp_type = be211_dhcp_type(payload, payload_size, true, sc->sc_nvm.hw_addr, &xid);
++                if (dhcp_type != be211_dhcp_discover && dhcp_type != be211_dhcp_request)
++                    continue;
++                bridge.xid = xid;
++                bridge.xid_valid = true;
++            } else if (payload_size < 28) {
++                continue;
++            }
++        }
++
++        memcpy(snap, be211_snap_prefix, sizeof(be211_snap_prefix));
++        memcpy(snap + sizeof(be211_snap_prefix), &ethernet.ether_type, sizeof(ethernet.ether_type));
++        const unsigned body_size = be211_snap_size + payload_size;
++        auto *packet = reinterpret_cast<be211_probe_tx_command *>(buffer);
++        const unsigned frame_size = sizeof(packet->frame) + body_size;
++        packet->header.cmd = IWX_TX_CMD;
++        packet->header.idx = index;
++        packet->header.qid = bridge.queue;
++        packet->tx.len = htole16(frame_size);
++        packet->tx.flags = htole16(IWX_TX_FLAGS_ENCRYPT_DIS | IWX_TX_FLAGS_CMD_RATE);
++        packet->tx.rate_n_flags = htole32(bridge.rate_flags);
++        packet->tx.offload_assist = htole32(itlTxOffloadHeader(sizeof(packet->frame), false));
++        packet->frame.i_fc[0] = IEEE80211_FC0_TYPE_DATA;
++        packet->frame.i_fc[1] = IEEE80211_FC1_DIR_TODS;
++        IEEE80211_ADDR_COPY(packet->frame.i_addr1, sc->sc_be211_auth_bssid);
++        IEEE80211_ADDR_COPY(packet->frame.i_addr2, sc->sc_nvm.hw_addr);
++        IEEE80211_ADDR_COPY(packet->frame.i_addr3, ethernet.ether_dhost);
++
++        auto &descriptor = static_cast<iwx_tfh_tfd *>(bridge.descriptors.vaddr)[index];
++        be211_fill_probe_tfd(descriptor, bridge.command.paddr + command_offset, body_size);
++        static_cast<uint16_t *>(bridge.byte_counts.vaddr)[index] = htole16(frame_size);
++        ++bridge.ring.write;
++        bridge.max_pending = MAX(bridge.max_pending, bridge.ring.pending());
++        if (!index && bridge.tx && (bridge.tx <= 256 || !(bridge.tx & 4095)))
++            IOLog("BE211 probe: BSD TX ring wrapped tx=%u reclaimed=%u write=%u\n",
++                  bridge.tx, bridge.reclaimed, static_cast<unsigned>(bridge.ring.write));
++        ++bridge.tx;
++        if (bridge.tx <= be211_web_trace_limit || dhcp_type)
++            IOLog("BE211 probe: BSD TX index=%u protocol=0x%x DHCP type=%u bytes=%u\n",
++                  index, protocol, dhcp_type, frame_size);
++        if (echo)
++            IOLog("BE211 probe: BSD ICMP TX index=%u id=%u seq=%u\n",
++                  index, be211_get_be16(echo + 4), be211_get_be16(echo + 6));
++        if (web_port && bridge.web_tx <= be211_web_trace_limit)
++            IOLog("BE211 probe: BSD web TX index=%u ip_protocol=%u remote_port=%u bytes=%u\n",
++                  index, payload[9], web_port, payload_size);
++        OSSynchronizeIO();
++        IWX_WRITE(sc, IWX_HBUS_TARG_WRPTR, (uint32_t(bridge.queue) << 16) | bridge.ring.write);
++    }
++}
++
++int ItlIwx::iwx_be211_mgmt_queue_probe(struct iwx_softc *sc)
++{
++#ifdef AIRPORT_VTD
++    const unsigned cmd_version = iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP,
++                                                     IWX_MLD_SCD_QUEUE_CONFIG_CMD);
++    const unsigned response_version = iwx_lookup_notif_ver(sc, IWX_DATA_PATH_GROUP,
++                                                           IWX_MLD_SCD_QUEUE_CONFIG_CMD);
++    IOLog("BE211 probe: management queue versions command=%u response=%u\n",
++          cmd_version, response_version);
++    if (cmd_version != 3 || response_version != 2)
++        return ENOTSUP;
++
++    constexpr unsigned slots = be211_probe_slots;
++    constexpr size_t byte_count_table_size = be211_probe_bc_bytes;
++    constexpr uint32_t station_mask = be211_probe_station_mask;
++    struct iwx_dma_info descriptors = {};
++    struct iwx_dma_info byte_counts = {};
++    int err = iwx_dma_contig_alloc(sc->sc_dmat, &descriptors,
++                                   slots * sizeof(iwx_tfh_tfd), 256);
++    if (err)
++        return ENOMEM;
++    err = iwx_dma_contig_alloc(sc->sc_dmat, &byte_counts, byte_count_table_size, 256);
++    if (err) {
++        iwx_dma_contig_free(&descriptors);
++        return ENOMEM;
++    }
++
++    struct iwx_dma_info auth_command = {};
++    if (sc->sc_be211_auth_target_configured &&
++        iwx_dma_contig_alloc(sc->sc_dmat, &auth_command,
++                             2 * be211_mgmt_command_stride, be211_mgmt_command_stride)) {
++        iwx_dma_contig_free(&byte_counts);
++        iwx_dma_contig_free(&descriptors);
++        return ENOMEM;
++    }
++
++    IOLog("BE211 probe: management queue DMA TFD bytes=%u BC bytes=%zu cb_size=%u\n",
++          static_cast<unsigned>(descriptors.size), byte_count_table_size,
++          static_cast<unsigned>(IWX_TFD_QUEUE_CB_SIZE(slots)));
++    IOLog("BE211 probe: management queue host ring 1 allocated=%u\n",
++          static_cast<unsigned>(sc->txq[1].desc_dma.vaddr != nullptr));
++    uint16_t queue = IWX_INVALID_QUEUE;
++    uint16_t write_pointer = 0;
++    const int generation = sc->sc_generation;
++    err = iwx_mld_queue_cmd(sc, station_mask, IWX_MGMT_TID, 0, slots,
++                            descriptors.paddr, byte_counts.paddr, &queue, &write_pointer);
++    IOLog("BE211 probe: SCD_QUEUE_CONFIG v3 add tid=%u slots=%u qid=%u wp=%u result=%d\n",
++          static_cast<unsigned>(IWX_MGMT_TID), slots, static_cast<unsigned>(queue),
++          static_cast<unsigned>(write_pointer), err);
++    if (!err && generation == sc->sc_generation && sc->sc_be211_auth_target_configured)
++        err = iwx_be211_auth_probe(sc, queue, write_pointer, slots, descriptors,
++                                    byte_counts, auth_command);
++    if (!err && generation == sc->sc_generation) {
++        err = iwx_mld_queue_cmd(sc, station_mask, IWX_MGMT_TID, 1, 0,
++                                0, 0, nullptr, nullptr);
++        IOLog("BE211 probe: SCD_QUEUE_CONFIG v3 remove result=%d\n", err);
++    }
++    if (generation != sc->sc_generation)
++        err = ENXIO;
++
++    // Keep submitted DMA pages out of the allocator until device stop.
++    sc->sc_dmat->deferRecycling();
++    iwx_dma_contig_free(&auth_command);
++    iwx_dma_contig_free(&byte_counts);
++    iwx_dma_contig_free(&descriptors);
++    return err;
++#else
++    return ENOTSUP;
++#endif
++}
++
++int ItlIwx::iwx_be211_context_probe(struct iwx_softc *sc, unsigned channel)
++{
++    unsigned phy_version = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_PHY_CONTEXT_CMD);
++    unsigned mac_version = iwx_lookup_cmd_ver(sc, IWX_MAC_CONF_GROUP, IWX_MLD_MAC_CONFIG_CMD);
++    unsigned link_version = iwx_lookup_cmd_ver(sc, IWX_MAC_CONF_GROUP, IWX_MLD_LINK_CONFIG_CMD);
++    unsigned sta_version = iwx_lookup_cmd_ver(sc, IWX_MAC_CONF_GROUP, IWX_MLD_STA_CONFIG_CMD);
++    unsigned remove_version = iwx_lookup_cmd_ver(sc, IWX_MAC_CONF_GROUP, IWX_MLD_STA_REMOVE_CMD);
++    IOLog("BE211 probe: context versions PHY=%u MAC=%u LINK=%u STA=%u STA_REMOVE=%u\n",
++          phy_version, mac_version, link_version, sta_version, remove_version);
++    // Core 106 omits STA_REMOVE from its version table. Use the base v1 ABI.
++    if (phy_version != 6 || mac_version != 4 || link_version != 8 || sta_version != 3 ||
++        (remove_version != 1 && remove_version != IWX_FW_CMD_VER_UNKNOWN) ||
++        channel < 1 || channel > 11)
++        return ENOTSUP;
++    if (sc->sc_flags & IWX_FLAG_RFKILL)
++        return EPERM;
++
++    // Create an unassociated MAC before adding the link and peer.
++    auto mac = be211_mac_context(sc, IWX_FW_CTXT_ACTION_ADD, 0);
++    const uint32_t mac_cmd = IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_MLD_MAC_CONFIG_CMD);
++    int err = iwx_send_cmd_pdu(sc, mac_cmd, 0, sizeof(mac), &mac);
++    IOLog("BE211 probe: MAC_CONFIG v4 add result=%d\n", err);
++    if (err)
++        return err;
++
++    struct iwx_be211_phy_context_v6 phy = {};
++    phy.action = htole32(IWX_FW_CTXT_ACTION_ADD);
++    phy.channel.channel = htole32(channel);
++    phy.channel.band = IWX_PHY_BAND_24;
++    phy.channel.width = IWX_PHY_VHT_CHANNEL_MODE20;
++    phy.secondary_control_location = IWX_PHY_VHT_CTRL_POS_1_ABOVE;
++    err = iwx_send_cmd_pdu(sc, IWX_PHY_CONTEXT_CMD, 0, sizeof(phy), &phy);
++    IOLog("BE211 probe: PHY_CONTEXT v6 add channel=%u result=%d\n", channel, err);
++    if (!err) {
++        // Firmware context IDs are all zero. The link starts without a PHY.
++        struct iwx_be211_link_context_v8 link = {};
++        const uint32_t link_cmd = IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_MLD_LINK_CONFIG_CMD);
++        link.action = htole32(IWX_FW_CTXT_ACTION_ADD);
++        link.phy_id = htole32(IWX_FW_CTXT_INVALID);
++        IEEE80211_ADDR_COPY(link.local_address, sc->sc_nvm.hw_addr);
++        err = iwx_send_cmd_pdu(sc, link_cmd, 0, sizeof(link), &link);
++        IOLog("BE211 probe: LINK_CONFIG v8 add bytes=%zu result=%d\n", sizeof(link), err);
++        if (err)
++            return err; // Preinit resets firmware and discards all contexts.
++
++        // Bind the PHY while the link is inactive, with basic 2.4 GHz rates.
++        link.action = htole32(IWX_FW_CTXT_ACTION_MODIFY);
++        link.phy_id = 0;
++        link.modify_mask = htole32(IWX_MLD_LINK_CONTEXT_MODIFY_RATES_INFO);
++        link.cck_rates = htole32((1U << IWX_RATE_1M_INDEX) | (1U << IWX_RATE_2M_INDEX) |
++                                (1U << IWX_RATE_5M_INDEX) | (1U << IWX_RATE_11M_INDEX));
++        link.ofdm_rates = htole32(((1U << IWX_RATE_6M_INDEX) | (1U << IWX_RATE_12M_INDEX) |
++                                 (1U << IWX_RATE_24M_INDEX)) >> IWX_FIRST_OFDM_RATE);
++        err = iwx_send_cmd_pdu(sc, link_cmd, 0, sizeof(link), &link);
++        IOLog("BE211 probe: LINK_CONFIG v8 bind PHY=0 channel=%u result=%d\n", channel, err);
++        if (err)
++            return err;
++
++        // Try the pre-association payload observed on AX211 with this assert.
++        link.modify_mask = htole32(IWX_MLD_LINK_CONTEXT_MODIFY_ACTIVE |
++                                   IWX_MLD_LINK_CONTEXT_MODIFY_RATES_INFO);
++        link.active = htole32(1);
++        // Firmware uses contiguous legacy indices, including 24 Mbps at bit 4.
++        link.ofdm_rates = htole32((1U << 0) | (1U << 2) | (1U << 4)); // 6, 12, 24 Mbps
++        link.beacon_interval = htole32(sc->sc_be211_peer_beacon_interval);
++        link.qos_flags = htole32(IWX_MAC_QOS_FLG_TGN);
++        constexpr uint8_t aifsn[] = {7, 3, 2, 2}; // BK, BE, VI, VO
++        static_assert(nitems(aifsn) == IWX_AC_NUM, "LINK_CONFIG v8 EDCA categories");
++        for (unsigned ac = 0; ac < nitems(aifsn); ++ac) {
++            link.ac[ac].cw_min = htole16(15);
++            link.ac[ac].cw_max = htole16(1023);
++            link.ac[ac].aifsn = aifsn[ac];
++            link.ac[ac].fifos_mask = 1U << (ac + 1);
++        }
++        IOLog("BE211 probe: activate request cmd=0x%x bytes=%zu mask=0x%x "
++              "link=%u mac=%u phy=%u state=%u cck=0x%x ofdm=0x%x beacon=%u qos=0x%x\n",
++              link_cmd, sizeof(link), le32toh(link.modify_mask), le32toh(link.link_id),
++              le32toh(link.mac_id), le32toh(link.phy_id), le32toh(link.active),
++              le32toh(link.cck_rates), le32toh(link.ofdm_rates),
++              le32toh(link.beacon_interval), le32toh(link.qos_flags));
++        err = iwx_send_cmd_pdu(sc, link_cmd, 0, sizeof(link), &link);
++        IOLog("BE211 probe: LINK_CONFIG v8 activate result=%d\n", err);
++        if (err)
++            return err;
++
++        // Register the observed AP on link 0 before allocating the queue.
++        auto peer = be211_peer_context(sc, 0);
++        err = iwx_send_cmd_pdu(sc, IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_MLD_STA_CONFIG_CMD),
++                               0, sizeof(peer), &peer);
++        IOLog("BE211 probe: STA_CONFIG v3 add bytes=%zu result=%d\n", sizeof(peer), err);
++        if (err)
++            return err;
++
++        err = iwx_be211_mgmt_queue_probe(sc);
++        if (err)
++            return err;
++
++        struct iwx_mld_mvm_remove_sta_cmd remove_peer = {};
++        remove_peer.sta_id = peer.sta_id;
++        err = iwx_send_cmd_pdu(sc, IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_MLD_STA_REMOVE_CMD),
++                               0, sizeof(remove_peer), &remove_peer);
++        IOLog("BE211 probe: STA_REMOVE v1 result=%d\n", err);
++        if (err)
++            return err;
++
++        link.modify_mask = htole32(IWX_MLD_LINK_CONTEXT_MODIFY_ACTIVE);
++        link.active = 0;
++        err = iwx_send_cmd_pdu(sc, link_cmd, 0, sizeof(link), &link);
++        IOLog("BE211 probe: LINK_CONFIG v8 deactivate result=%d\n", err);
++        if (err)
++            return err;
++
++        link = {};
++        link.action = htole32(IWX_FW_CTXT_ACTION_REMOVE);
++        link.phy_id = htole32(IWX_FW_CTXT_INVALID);
++        err = iwx_send_cmd_pdu(sc, link_cmd, 0, sizeof(link), &link);
++        IOLog("BE211 probe: LINK_CONFIG v8 remove result=%d\n", err);
++        if (err)
++            return err;
++
++        phy.action = htole32(IWX_FW_CTXT_ACTION_REMOVE);
++        err = iwx_send_cmd_pdu(sc, IWX_PHY_CONTEXT_CMD, 0, sizeof(phy), &phy);
++        IOLog("BE211 probe: PHY_CONTEXT v6 remove result=%d\n", err);
++    }
++
++    mac = {};
++    mac.action = htole32(IWX_FW_CTXT_ACTION_REMOVE);
++    int remove_err = iwx_send_cmd_pdu(sc, mac_cmd, 0, sizeof(mac), &mac);
++    IOLog("BE211 probe: MAC_CONFIG v4 remove result=%d\n", remove_err);
++    return err ? err : remove_err;
++}
++
++int ItlIwx::scanBE211(uint16_t channels)
++{
++    auto sc = &com;
++    if (!isBE211ScanOnly() || !getMainWorkLoop()->inGate() ||
++        getMainWorkLoop()->onThread() || !channels)
++        return EINVAL;
++    if (be211ScanBusy())
++        return EBUSY;
++
++    sc->sc_be211_runtime_scan = true;
++    sc->sc_be211_requested_channels = channels;
++    const int generation = sc->sc_generation;
++    int err = iwx_start_hw(sc);
++    if (!err)
++        err = iwx_run_init_mvm_ucode(sc, 0);
++    if (generation == sc->sc_generation)
++        iwx_stop_device(sc);
++    else
++        err = ENXIO;
++    sc->sc_be211_runtime_scan = false;
++    return err;
++}
++
++int ItlIwx::probeBE211Join(const uint8_t *ssid, size_t length, const uint8_t *bssid,
++                          BE211AssociationObserver observer, void *context)
+ {
+-    XYLog("%s\n", __FUNCTION__);
+-    struct iwx_dqa_enable_cmd dqa_cmd = {
+-        .cmd_queue = htole32(IWX_DQA_CMD_QUEUE),
+-    };
+-    uint32_t cmd_id;
+-    
+-    cmd_id = iwx_cmd_id(IWX_DQA_ENABLE_CMD, IWX_DATA_PATH_GROUP, 0);
+-    return iwx_send_cmd_pdu(sc, cmd_id, 0, sizeof(dqa_cmd), &dqa_cmd);
++    if (!isBE211ScanOnly() || !getMainWorkLoop()->inGate() ||
++        getMainWorkLoop()->onThread() || !ssid || !length || length > IEEE80211_NWID_LEN)
++        return EINVAL;
++    if (be211ScanBusy())
++        return EBUSY;
++    auto sc = &com;
++
++    memcpy(sc->sc_be211_auth_ssid, ssid, length);
++    sc->sc_be211_auth_ssid[length] = 0;
++    sc->sc_be211_auth_ssid_len = length;
++    sc->sc_be211_auth_target_configured = true;
++    sc->sc_be211_join_pin_bssid = bssid && iwx_is_valid_mac_addr(bssid);
++    if (sc->sc_be211_join_pin_bssid)
++        IEEE80211_ADDR_COPY(sc->sc_be211_auth_bssid, bssid);
++    sc->sc_be211_runtime_dhcp_result = ENOENT;
++    sc->sc_be211_join_cancelled = false;
++    sc->sc_be211_association_observer = observer;
++    sc->sc_be211_association_context = context;
++    sc->sc_be211_runtime_join = true;
++    sc->sc_be211_join_beacon_logs = 0;
++    const uint8_t unspecified[IEEE80211_ADDR_LEN] = {};
++    const auto *requested = bssid ? bssid : unspecified;
++    IOLog("BE211 probe: runtime join started ssid=%s pin_bssid=%u requested_bssid=%02x:%02x:%02x:%02x:%02x:%02x\n",
++          sc->sc_be211_auth_ssid, static_cast<unsigned>(sc->sc_be211_join_pin_bssid),
++          requested[0], requested[1], requested[2], requested[3], requested[4], requested[5]);
++    const int generation = sc->sc_generation;
++    int err = iwx_start_hw(sc);
++    if (!err)
++        err = iwx_run_init_mvm_ucode(sc, 0);
++    if (generation == sc->sc_generation)
++        iwx_stop_device(sc);
++    else
++        err = ENXIO;
++    sc->sc_be211_runtime_join = false;
++    sc->sc_be211_association_observer = nullptr;
++    sc->sc_be211_association_context = nullptr;
++    sc->sc_be211_join_pin_bssid = false;
++    sc->sc_be211_auth_target_configured = false;
++    sc->sc_be211_auth_ssid_len = 0;
++    IOLog("BE211 probe: runtime join diagnostic complete result=%d\n", err);
++    return err;
+ }
+ 
+-int ItlIwx::
+-iwx_load_ucode_wait_alive(struct iwx_softc *sc)
++void ItlIwx::cancelBE211Join(const char *source, bool stopping)
+ {
+-    XYLog("%s\n", __FUNCTION__);
+-    int err;
+-    
+-    err = iwx_read_firmware(sc);
+-    if (err)
+-        return err;
+-    
+-    err = iwx_start_fw(sc);
+-    if (err)
+-        return err;
+-    
+-    err = iwx_load_pnvm(sc);
+-    if (err)
+-        return err;
+-    
+-    iwx_post_alive(sc);
+-    
+-    return 0;
++    if (getMainWorkLoop()->inGate() && com.sc_be211_runtime_join &&
++        (!com.sc_be211_join_cancelled || stopping)) {
++        IOLog("BE211 probe: join cancellation source=%s window=%u stopping=%u generation=%d\n",
++              source, static_cast<unsigned>(com.sc_be211_bsd_active),
++              static_cast<unsigned>(stopping), com.sc_generation);
++        com.sc_be211_join_cancelled = true;
++        if (com.sc_be211_bsd_active) {
++            com.sc_be211_bsd_stop = 1;
++            getMainCommandGate()->commandWakeup(&com.sc_be211_bsd_stop);
++        }
++        if (stopping || !com.sc_be211_bsd_active) {
++            ++com.sc_generation;
++            iwx_stop_device(&com);
++        }
++    }
+ }
+ 
+ int ItlIwx::
+@@ -5748,6 +7107,188 @@ iwx_run_init_mvm_ucode(struct iwx_softc *sc, int readnvm)
+         return err;
+     }
+     
++    if (sc->sc_be.family == IwxBE::SC) {
++        unsigned phy_version = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP,
++                                                   IWX_PHY_CONFIGURATION_CMD);
++        if (phy_version != 3) {
++            IOLog("BE211 probe: unsupported PHY_CONFIGURATION version=%u\n",
++                  phy_version);
++            return ENOTSUP;
++        }
++
++        init_cfg.init_flags = htole32(IWX_INIT_PHY);
++        err = iwx_send_cmd_pdu(sc, IWX_WIDE_ID(IWX_SYSTEM_GROUP,
++            IWX_INIT_EXTENDED_CFG_CMD), 0, sizeof(init_cfg), &init_cfg);
++        IOLog("BE211 probe: INIT_EXTENDED_CFG result=%d\n", err);
++        if (err)
++            return err;
++
++        err = iwx_send_phy_cfg_cmd(sc);
++        IOLog("BE211 probe: PHY_CONFIGURATION v3 result=%d\n", err);
++        if (err)
++            return err;
++
++        err = iwx_wait_notification(sc, &sc->sc_init_complete, wait_flags, 2000);
++        IOLog("BE211 probe: INIT_COMPLETE result=%d\n", err);
++        if (err)
++            return err;
++        err = iwx_nvm_get(sc);
++        IOLog("BE211 probe: NVM_GET_INFO result=%d\n", err);
++        if (err)
++            return err;
++        err = iwx_be211_shared_mem_probe(sc);
++        IOLog("BE211 probe: SHARED_MEM_CFG result=%d\n", err);
++        if (err)
++            return err;
++
++        unsigned ant_version = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP,
++                                                   IWX_TX_ANT_CONFIGURATION_CMD);
++        uint8_t tx_mask = iwx_fw_valid_tx_ant(sc);
++        if (ant_version != 1 || !tx_mask || !sc->sc_nvm.valid_tx_ant) {
++            IOLog("BE211 probe: unsupported TX_ANT_CONFIGURATION version=%u mask=0x%x\n",
++                  ant_version, tx_mask);
++            return ENOTSUP;
++        }
++        err = iwx_send_tx_ant_cfg(sc, tx_mask);
++        IOLog("BE211 probe: TX_ANT_CONFIGURATION mask=0x%x result=%d\n",
++              tx_mask, err);
++        if (err)
++            return err;
++        unsigned bt_version = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_BT_CONFIG);
++        unsigned soc_version = iwx_lookup_cmd_ver(sc, IWX_SYSTEM_GROUP,
++                                                  IWX_SOC_CONFIGURATION_CMD);
++        if (bt_version != 6 || soc_version != 2) {
++            IOLog("BE211 probe: unsupported BT_CONFIG version=%u SOC_CONFIGURATION version=%u\n",
++                  bt_version, soc_version);
++            return ENOTSUP;
++        }
++
++        static_assert(sizeof(iwx_bt_coex_cmd) == 8, "BT_CONFIG v6 size");
++        struct iwx_bt_coex_cmd bt_config = {
++            htole32(IWX_BT_COEX_NW),
++            htole32(IWX_BT_COEX_MPLUT_ENABLED | IWX_BT_COEX_HIGH_BAND_RET)
++        };
++        err = iwx_send_cmd_pdu(sc, IWX_BT_CONFIG, 0, sizeof(bt_config), &bt_config);
++        IOLog("BE211 probe: BT_CONFIG v6 result=%d\n", err);
++        if (err)
++            return err;
++
++        // The SC profile enables low-latency XTAL and uses the 2500 us LTR delay.
++        // LTR delay is a two-bit field at bits 3:2, not an unshifted enum.
++        const uint32_t soc_flags = IWX_SOC_CONFIG_CMD_FLAGS_LOW_LATENCY |
++                                   (IWX_SOC_FLAGS_LTR_APPLY_DELAY_2500 << 2);
++        const uint32_t xtal_latency = 12000;
++        static_assert(sizeof(iwx_soc_configuration_cmd) == 8, "SOC_CONFIGURATION v2 size");
++        struct iwx_soc_configuration_cmd soc_config = {
++            htole32(soc_flags), htole32(xtal_latency)
++        };
++        err = iwx_send_cmd_pdu(sc, IWX_WIDE_ID(IWX_SYSTEM_GROUP, IWX_SOC_CONFIGURATION_CMD),
++                               0, sizeof(soc_config), &soc_config);
++        IOLog("BE211 probe: SOC_CONFIGURATION v2 flags=0x%x latency=%u result=%d\n",
++              soc_flags, xtal_latency, err);
++        if (err)
++            return err;
++        unsigned thermal_version = iwx_lookup_cmd_ver(sc, IWX_PHY_OPS_GROUP,
++                                                       IWX_TEMP_REPORTING_THRESHOLDS_CMD);
++        unsigned scan_version = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_SCAN_CFG_CMD);
++        uint8_t rx_mask = iwx_fw_valid_rx_ant(sc);
++        if (thermal_version != 1 || scan_version != 5 || !rx_mask ||
++            !sc->sc_nvm.valid_rx_ant) {
++            IOLog("BE211 probe: unsupported temperature reporting v%u or scan configuration v%u, RX mask=0x%x\n",
++                  thermal_version, scan_version, rx_mask);
++            return ENOTSUP;
++        }
++
++        static_assert(sizeof(iwx_temp_report_ths_cmd) == 20, "temperature thresholds v1 size");
++        err = iwx_send_temp_report_ths_cmd(sc);
++        IOLog("BE211 probe: TEMP_REPORTING_THRESHOLDS v1 result=%d\n", err);
++        if (err)
++            return err;
++
++        // The v5 scan configuration has no broadcast station assignment.
++        static_assert(sizeof(iwx_scan_config) == 12, "SCAN_CFG v5 size");
++        struct iwx_scan_config scan_config = {};
++        scan_config.tx_chains = htole32(tx_mask);
++        scan_config.rx_chains = htole32(rx_mask);
++        err = iwx_send_cmd_pdu(sc, IWX_WIDE_ID(IWX_LONG_GROUP, IWX_SCAN_CFG_CMD),
++                               0, sizeof(scan_config), &scan_config);
++        IOLog("BE211 probe: SCAN_CFG v5 TX=0x%x RX=0x%x result=%d\n",
++              tx_mask, rx_mask, err);
++        if (err)
++            return err;
++        unsigned power_version = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_POWER_TABLE_CMD);
++        if (power_version != 7) {
++            IOLog("BE211 probe: unsupported POWER_TABLE version=%u\n", power_version);
++            return ENOTSUP;
++        }
++        // Keep device power saving off during this short probe.
++        static_assert(sizeof(iwx_device_power_cmd) == 4, "POWER_TABLE v7 size");
++        struct iwx_device_power_cmd power_config = {};
++        err = iwx_send_cmd_pdu(sc, IWX_POWER_TABLE_CMD, 0, sizeof(power_config),
++                               &power_config);
++        IOLog("BE211 probe: POWER_TABLE v7 flags=0x0 result=%d\n", err);
++        if (err)
++            return err;
++        uint16_t scan_channels = 0;
++        err = iwx_be211_mcc_probe(sc, &scan_channels);
++        IOLog("BE211 probe: MCC_UPDATE result=%d\n", err);
++        if (err)
++            return err;
++        scan_channels &= sc->sc_be211_nvm_scan_channels;
++        if (sc->sc_be211_runtime_scan) {
++            err = iwx_be211_passive_scan(sc, scan_channels & sc->sc_be211_requested_channels);
++            IOLog("BE211 probe: runtime passive scan result=%d\n", err);
++            return err;
++        }
++        // The interface is published at boot. Perform the join only when requested by macOS.
++        const bool joining = sc->sc_be211_runtime_join;
++        err = iwx_be211_passive_scan(sc, scan_channels);
++        IOLog("BE211 probe: passive scan result=%d\n", err);
++        if (err)
++            return err;
++        err = iwx_set_mac_addr_from_csr(sc, &sc->sc_nvm);
++        if (!err && !iwx_is_valid_mac_addr(sc->sc_nvm.hw_addr))
++            err = EINVAL;
++        IOLog("BE211 probe: hardware MAC validation result=%d\n", err);
++        if (err)
++            return err;
++
++        if (joining) {
++            // Match the address currently assigned to the BSD interface by macOS.
++            if (!iwx_is_valid_mac_addr(sc->sc_ic.ic_myaddr))
++                return EINVAL;
++            IEEE80211_ADDR_COPY(sc->sc_nvm.hw_addr, sc->sc_ic.ic_myaddr);
++            const unsigned channel = sc->sc_be211_peer_channel;
++            if (channel && (scan_channels & (1U << (channel - 1)))) {
++                sc->sc_be211_auth_channel = channel;
++                IEEE80211_ADDR_COPY(sc->sc_be211_auth_bssid, sc->sc_be211_peer_bssid);
++                const auto *bssid = sc->sc_be211_auth_bssid;
++                IOLog("BE211 probe: SSID target selected bssid=%02x:%02x:%02x:%02x:%02x:%02x channel=%u rates=%u\n",
++                      bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
++                      channel, sc->sc_be211_assoc_rate_count);
++                const int peer_err = iwx_be211_context_probe(sc, channel);
++                IOLog("BE211 probe: runtime association result=%d BSD packet test result=%d\n",
++                      peer_err, sc->sc_be211_runtime_dhcp_result);
++                return peer_err ? peer_err : sc->sc_be211_runtime_dhcp_result;
++            }
++            IOLog("BE211 probe: runtime join found no eligible configured beacon\n");
++            return ENOENT;
++        }
++        // Preinit resets firmware before interface registration even on success.
++        IEEE80211_ADDR_COPY(sc->sc_ic.ic_myaddr, sc->sc_nvm.hw_addr);
++        // Publish only the passive 20 MHz channels tested by the boot probe.
++        uint32_t profile[11] = {};
++        for (unsigned index = 0; index < nitems(profile); ++index) {
++            if (scan_channels & (1U << index))
++                profile[index] = htole32(IWX_NVM_CHANNEL_VALID);
++        }
++        iwx_init_channel_map(sc, nullptr, profile, nitems(profile), "BE211 probe");
++        sc->sc_pcitag->setProperty("AirportItlwm-BE211Probe", "interface-only");
++        IOLog("BE211 probe: interface preinit ready, passive 2.4 GHz mask=0x%x\n",
++              scan_channels);
++        return 0;
++    }
++
+     if (sc->sc_tx_with_siso_diversity)
+         init_cfg.init_flags |= htole32(IWX_INIT_PHY);
+ 
+@@ -12690,6 +14231,65 @@ iwx_parse_mcc_update_response(const struct iwx_rx_packet *pkt,
+     return 0;
+ }
+ 
++int ItlIwx::
++iwx_be211_mcc_probe(struct iwx_softc *sc, uint16_t *scan_channels)
++{
++    unsigned command_version = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_MCC_UPDATE_CMD);
++    unsigned response_version = iwx_lookup_notif_ver(sc, IWX_LONG_GROUP, IWX_MCC_UPDATE_CMD);
++    IOLog("BE211 probe: MCC_UPDATE command v%u response v%u\n",
++          command_version, response_version);
++    if (command_version != 1 || response_version != 9)
++        return ENOTSUP;
++
++    // Linux MLD uses the 28-byte request and v8 wire layout for v9 replies.
++    static_assert(sizeof(iwx_mcc_update_cmd) == 28, "MCC_UPDATE request size");
++    static_assert(sizeof(iwx_mcc_update_resp_v8) == 24, "MCC_UPDATE response header size");
++    struct iwx_mcc_update_cmd request = {};
++    request.mcc = htole16(('Z' << 8) | 'Z');
++    request.source_id = IWX_MCC_SOURCE_GET_CURRENT;
++
++    struct iwx_host_cmd cmd = {};
++    cmd.id = IWX_MCC_UPDATE_CMD;
++    cmd.flags = IWX_CMD_WANT_RESP;
++    cmd.data[0] = &request;
++    cmd.len[0] = sizeof(request);
++    cmd.resp_pkt_len = IWX_CMD_RESP_MAX;
++    int err = iwx_send_cmd(sc, &cmd);
++    if (err)
++        return err;
++    if (!cmd.resp_pkt)
++        return EIO;
++
++    struct iwx_mcc_response_view view = {};
++    err = iwx_parse_mcc_update_response(cmd.resp_pkt, response_version, false, &view);
++    size_t bytes = iwx_rx_packet_payload_len(cmd.resp_pkt);
++    if (!err) {
++        IOLog("BE211 probe: MCC_UPDATE bytes=%zu status=0x%x MCC=0x%04x source=%u cap=0x%x geo=0x%x channels=%u\n",
++              bytes, view.status, view.mcc, view.source_id, view.cap,
++              view.geo_info, view.n_channels);
++        if (!view.mcc || !view.n_channels ||
++            (view.status != IWX_MCC_RESP_NEW_CHAN_PROFILE &&
++             view.status != IWX_MCC_RESP_SAME_CHAN_PROFILE))
++            err = EIO;
++        if (!err) {
++            sc->sc_be211_mcc_active_channels = 0;
++            for (unsigned index = 0; index < MIN(view.n_channels, 11U); ++index) {
++                uint32_t flags = le32toh(view.channels[index]);
++                if (flags & IWX_NVM_CHANNEL_VALID)
++                    *scan_channels |= 1U << index;
++                if ((flags & (IWX_NVM_CHANNEL_VALID | IWX_NVM_CHANNEL_ACTIVE | IWX_NVM_CHANNEL_RADAR)) ==
++                    (IWX_NVM_CHANNEL_VALID | IWX_NVM_CHANNEL_ACTIVE))
++                    sc->sc_be211_mcc_active_channels |= 1U << index;
++            }
++        }
++    } else {
++        IOLog("BE211 probe: MCC_UPDATE invalid response bytes=%zu channels=%u\n",
++              bytes, view.n_channels);
++    }
++    iwx_free_resp(sc, &cmd);
++    return err;
++}
++
+ static bool
+ iwx_mcc_profile_changed(uint32_t status)
+ {
+@@ -13199,6 +14799,9 @@ iwx_init(struct _ifnet *ifp)
+     int err, generation;
+     int i;
+ 
++    if (sc->sc_be.family == IwxBE::SC)
++        return ENOTSUP;
++
+     memset(sc->sc_tid_data, 0, sizeof(sc->sc_tid_data));
+     for (i = 0; i < ARRAY_SIZE(sc->sc_tid_data); i++) {
+         sc->sc_tid_data[i].qid = IWX_INVALID_QUEUE;
+@@ -13313,6 +14916,12 @@ _iwx_start_task(OSObject *target, void *arg0, void *arg1, void *arg2, void *arg3
+     struct _ifnet *ifp = (struct _ifnet *)arg0;
+     struct iwx_softc *sc = (struct iwx_softc *)ifp->if_softc;
+     ItlIwx *that = container_of(sc, ItlIwx, com);
++    if (sc->sc_be211_bsd_active) {
++        that->iwx_be211_bsd_output(sc);
++        return kIOReturnSuccess;
++    }
++    if (that->isBE211ScanOnly())
++        return kIOReturnNotReady;
+     struct ieee80211com *ic = &sc->sc_ic;
+     struct ieee80211_node *ni;
+     struct ether_header *eh;
+@@ -13772,6 +15381,11 @@ iwx_nic_umac_error(struct iwx_softc *sc)
+         table.stack_pointer, table.nic_isr_pref, table.umac_major,
+         table.umac_minor);
+     sc->sc_pcitag->setProperty("AirportItlwm-FirmwareErrorUm", error_umac);
++    if (isBE211ScanOnly()) {
++        sc->sc_pcitag->setProperty("AirportItlwm-FirmwareErrorUmTable",
++                                  &table, sizeof(table));
++        IOLog("BE211 probe: firmware error UMAC valid=%u %s\n", table.valid, error_umac);
++    }
+ #endif
+ }
+ 
+@@ -13854,6 +15468,8 @@ iwx_nic_error(struct iwx_softc *sc)
+         sc->sc_pcitag->setProperty("AirportItlwm-FirmwareErrorLmac",
+             "invalid-pointer");
+ #endif
++        if (isBE211ScanOnly() && sc->sc_uc.uc_umac_error_event_table)
++            iwx_nic_umac_error(sc);
+         return;
+     }
+ 
+@@ -13863,6 +15479,8 @@ iwx_nic_error(struct iwx_softc *sc)
+         sc->sc_pcitag->setProperty("AirportItlwm-FirmwareErrorLmac",
+             "read-failed");
+ #endif
++        if (isBE211ScanOnly() && sc->sc_uc.uc_umac_error_event_table)
++            iwx_nic_umac_error(sc);
+         return;
+     }
+ 
+@@ -13872,6 +15490,8 @@ iwx_nic_error(struct iwx_softc *sc)
+         sc->sc_pcitag->setProperty("AirportItlwm-FirmwareErrorLmac",
+             "no-errlog");
+ #endif
++        if (isBE211ScanOnly() && sc->sc_uc.uc_umac_error_event_table)
++            iwx_nic_umac_error(sc);
+         return;
+     }
+ 
+@@ -13933,6 +15553,12 @@ iwx_nic_error(struct iwx_softc *sc)
+         table.isr4, table.fw_rev_type, table.major, table.minor,
+         table.hw_ver, table.brd_ver);
+     sc->sc_pcitag->setProperty("AirportItlwm-FirmwareErrorLmac", error_lmac);
++    if (isBE211ScanOnly()) {
++        sc->sc_pcitag->setProperty("AirportItlwm-FirmwareErrorLmacTable",
++                                  &table, sizeof(table));
++        IOLog("BE211 probe: firmware error LMAC valid=%u data3=0x%08x pc=0x%08x %s\n",
++              table.valid, table.data3, table.log_pc, error_lmac);
++    }
+ #endif
+ 
+     if (sc->sc_uc.uc_umac_error_event_table)
+@@ -13961,6 +15587,393 @@ sizeof(*(_var_)), BUS_DMASYNC_POSTREAD);            \
+ _var_ = (t)((_pkt_)+1);                    \
+ } while (/*CONSTCOND*/0)
+ 
++void ItlIwx::
++iwx_be211_count_beacon(struct iwx_softc *sc, const struct iwx_rx_packet *pkt)
++{
++    // RX MPDU v8 keeps the v3 tail and the common length and status offsets.
++    static_assert(sizeof(iwx_rx_mpdu_desc) == 64, "RX MPDU v8 descriptor size");
++    static_assert(offsetof(iwx_rx_mpdu_desc, status) == 12, "RX MPDU status offset");
++    static_assert(offsetof(iwx_rx_mpdu_desc, v3.channel) == 42, "RX MPDU channel offset");
++    ++sc->sc_be211_scan_frames;
++    const size_t payload_len = iwx_rx_packet_payload_len(pkt);
++    if (payload_len < sizeof(iwx_rx_mpdu_desc))
++        return;
++
++    const auto *desc = reinterpret_cast<const iwx_rx_mpdu_desc *>(pkt->data);
++    const size_t frame_len = le16toh(desc->mpdu_len);
++    const uint32_t good_status = IWX_RX_MPDU_RES_STATUS_CRC_OK |
++                                 IWX_RX_MPDU_RES_STATUS_OVERRUN_OK;
++    if (!frame_len || frame_len > payload_len - sizeof(*desc) ||
++        (le32toh(desc->status) & good_status) != good_status)
++        return;
++    ++sc->sc_be211_scan_valid_mpdu;
++
++    const size_t pad = (desc->mac_flags2 & IWX_RX_MPDU_MFLG2_PAD) ? 2 : 0;
++    constexpr size_t beacon_fixed_len = 12; // Timestamp, interval and capability.
++    unsigned band = (desc->mac_phy_idx & IWX_RX_MPDU_BAND_MASK) >> IWX_RX_MPDU_BAND_POS;
++    if (band != IWX_PHY_BAND_24 || desc->v3.channel < 1 || desc->v3.channel > 11 ||
++        frame_len < sizeof(ieee80211_frame) + pad + beacon_fixed_len)
++        return;
++
++    const auto *frame = reinterpret_cast<const ieee80211_frame *>(desc + 1);
++    const size_t trailer = (desc->mac_flags1 & IWX_RX_MPDU_MFLG1_MIC_CRC_LEN_MASK) >>
++                           IWX_RX_MPDU_MFLG1_MIC_CRC_LEN_SHIFT;
++    if (sc->sc_be211_bsd_active && desc->v3.channel == sc->sc_be211_auth_channel &&
++        frame_len >= sizeof(*frame) + pad + sizeof(uint16_t) + trailer &&
++        (frame->i_fc[0] == IEEE80211_FC0_SUBTYPE_DISASSOC ||
++         frame->i_fc[0] == IEEE80211_FC0_SUBTYPE_DEAUTH) &&
++        !(frame->i_fc[1] & (IEEE80211_FC1_DIR_MASK | IEEE80211_FC1_PROTECTED)) &&
++        IEEE80211_ADDR_EQ(frame->i_addr1, sc->sc_nvm.hw_addr) &&
++        IEEE80211_ADDR_EQ(frame->i_addr2, sc->sc_be211_auth_bssid) &&
++        IEEE80211_ADDR_EQ(frame->i_addr3, sc->sc_be211_auth_bssid)) {
++        const auto *reason = reinterpret_cast<const uint8_t *>(frame + 1) + pad;
++        IOLog("BE211 probe: BSD peer disconnect subtype=0x%x reason=%u\n",
++              frame->i_fc[0], static_cast<unsigned>(reason[0] | (reason[1] << 8)));
++        sc->sc_be211_bsd_stop = 1;
++        getMainCommandGate()->commandWakeup(&sc->sc_be211_bsd_stop);
++        return;
++    }
++    if (frame->i_fc[0] != IEEE80211_FC0_SUBTYPE_BEACON ||
++        (frame->i_fc[1] & (IEEE80211_FC1_DIR_MASK | IEEE80211_FC1_PROTECTED)) ||
++        !iwx_is_valid_mac_addr(frame->i_addr3))
++        return;
++
++    const size_t elements_offset = sizeof(*frame) + pad + beacon_fixed_len;
++    const uint8_t *ssid = reinterpret_cast<const uint8_t *>(frame) + elements_offset;
++    const size_t elements_len = frame_len - elements_offset;
++    const bool pinned_peer = sc->sc_be211_join_pin_bssid &&
++        IEEE80211_ADDR_EQ(frame->i_addr3, sc->sc_be211_auth_bssid);
++    const auto log_join_beacon = [&](const char *outcome) {
++        constexpr unsigned max_beacon_logs = 32;
++        if (sc->sc_be211_join_beacon_logs == max_beacon_logs)
++            IOLog("BE211 probe: join beacon trace limit reached\n");
++        if (sc->sc_be211_join_beacon_logs <= max_beacon_logs)
++            ++sc->sc_be211_join_beacon_logs;
++        if (sc->sc_be211_join_beacon_logs > max_beacon_logs)
++            return;
++        const auto *addr = frame->i_addr3;
++        IOLog("BE211 probe: join beacon bssid=%02x:%02x:%02x:%02x:%02x:%02x channel=%u requested=%u outcome=%s\n",
++              addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
++              static_cast<unsigned>(desc->v3.channel), static_cast<unsigned>(pinned_peer), outcome);
++    };
++    if (elements_len < 2 || ssid[0] != IEEE80211_ELEMID_SSID ||
++        ssid[1] > IEEE80211_NWID_LEN || ssid[1] > elements_len - 2) {
++        if (sc->sc_be211_runtime_join && pinned_peer && !sc->sc_be211_peer_channel &&
++            !sc->sc_be211_post_assoc_observing)
++            log_join_beacon("missing-or-invalid-ssid-element");
++        return;
++    }
++
++    if (sc->sc_be211_post_assoc_observing) {
++        if (desc->v3.channel == sc->sc_be211_auth_channel &&
++            IEEE80211_ADDR_EQ(frame->i_addr2, sc->sc_be211_auth_bssid) &&
++            IEEE80211_ADDR_EQ(frame->i_addr3, sc->sc_be211_auth_bssid)) {
++            // Keep the actual peer frame for WCL publication and beacon queries.
++            if (sc->sc_be211_association_observer) {
++                if (elements_len < trailer + 2 + ssid[1] ||
++                    ssid[1] != sc->sc_be211_auth_ssid_len ||
++                    memcmp(ssid + 2, sc->sc_be211_auth_ssid, ssid[1]) ||
++                    frame_len - pad - trailer > sizeof(sc->sc_be211_peer_beacon))
++                    return;
++                auto *beacon = sc->sc_be211_peer_beacon;
++                memcpy(beacon, frame, sizeof(*frame));
++                memcpy(beacon + sizeof(*frame), reinterpret_cast<const uint8_t *>(frame) +
++                       sizeof(*frame) + pad, frame_len - sizeof(*frame) - pad - trailer);
++                sc->sc_be211_peer_beacon_size = frame_len - pad - trailer;
++                sc->sc_be211_peer_beacon_rssi = MIN(sc->sc_ic.ic_max_rssi,
++                    MAX(0, iwx_rxmq_get_signal_strength(sc,
++                        const_cast<iwx_rx_mpdu_desc *>(desc)) - IWX_MIN_DBM));
++            }
++            if (!sc->sc_be211_post_assoc_beacon) {
++                IOLog("BE211 probe: post-association beacon from peer channel=%u\n",
++                      static_cast<unsigned>(desc->v3.channel));
++                sc->sc_be211_post_assoc_beacon = 1;
++                getMainCommandGate()->commandWakeup(&sc->sc_be211_post_assoc_beacon);
++            }
++
++        }
++        return;
++    }
++    ++sc->sc_be211_scan_beacons;
++    if (!sc->sc_be211_runtime_scan && !sc->sc_be211_peer_channel) {
++        const uint8_t *fixed = ssid - beacon_fixed_len;
++        const uint16_t interval = fixed[8] | (fixed[9] << 8);
++        const uint16_t capabilities = fixed[10] | (fixed[11] << 8);
++        const char *rejection = nullptr;
++        bool match = !sc->sc_be211_auth_target_configured ||
++            (desc->v3.channel == sc->sc_be211_auth_channel &&
++             IEEE80211_ADDR_EQ(frame->i_addr3, sc->sc_be211_auth_bssid));
++        if (sc->sc_be211_auth_ssid_len) {
++            const unsigned bit = 1U << (desc->v3.channel - 1);
++            const bool ssid_match = ssid[1] == sc->sc_be211_auth_ssid_len &&
++                memcmp(ssid + 2, sc->sc_be211_auth_ssid, ssid[1]) == 0;
++            if (!ssid_match)
++                rejection = "ssid-mismatch";
++            else if (sc->sc_be211_join_pin_bssid && !pinned_peer)
++                rejection = "bssid-mismatch";
++            else if (capabilities & IEEE80211_CAPINFO_PRIVACY)
++                rejection = "privacy-bit";
++            else if (!(sc->sc_be211_nvm_active_channels & sc->sc_be211_mcc_active_channels & bit))
++                rejection = "channel-not-active";
++            else if (elements_len < size_t(2 + ssid[1]) + trailer)
++                rejection = "truncated-elements";
++            match = !rejection;
++            if (match) {
++                constexpr uint8_t legacy_rates[] = {2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108};
++                unsigned count = 0;
++                unsigned seen = 0;
++                size_t offset = 2 + ssid[1];
++                const size_t end = elements_len - trailer;
++                while (offset + 2 <= end) {
++                    const auto *ie = ssid + offset;
++                    if (ie[1] > end - offset - 2) {
++                        rejection = "truncated-element";
++                        break;
++                    }
++                    if (ie[0] == IEEE80211_ELEMID_RSN ||
++                        (ie[0] == IEEE80211_ELEMID_VENDOR && ie[1] >= 4 &&
++                         ie[2] == 0 && ie[3] == 0x50 && ie[4] == 0xf2 && ie[5] == 1)) {
++                        rejection = "rsn-or-wpa-element";
++                        break;
++                    }
++                    if (ie[0] == IEEE80211_ELEMID_RATES || ie[0] == IEEE80211_ELEMID_XRATES) {
++                        for (unsigned i = 0; i < ie[1]; ++i) {
++                            const uint8_t rate = ie[2 + i];
++                            for (unsigned j = 0; j < nitems(legacy_rates); ++j) {
++                                if ((rate & 0x7f) == legacy_rates[j] && !(seen & (1U << j))) {
++                                    sc->sc_be211_assoc_rates[count++] = rate;
++                                    seen |= 1U << j;
++                                    break;
++                                }
++                            }
++                        }
++                    }
++                    offset += 2 + ie[1];
++                }
++                match = offset == end && count != 0;
++                if (!match && !rejection)
++                    rejection = offset == end ? "no-usable-legacy-rates" : "trailing-element-byte";
++                sc->sc_be211_assoc_rate_count = count;
++            }
++            if (sc->sc_be211_runtime_join && (pinned_peer || ssid_match)) {
++                if (match) {
++                    if (!interval)
++                        rejection = "zero-beacon-interval";
++                    else if (!(capabilities & IEEE80211_CAPINFO_ESS) ||
++                             (capabilities & IEEE80211_CAPINFO_IBSS))
++                        rejection = "not-infrastructure";
++                    else if (!IEEE80211_ADDR_EQ(frame->i_addr2, frame->i_addr3))
++                        rejection = "transmitter-bssid-mismatch";
++                }
++                log_join_beacon(rejection ? rejection : "eligible");
++            }
++        }
++        if (interval && (capabilities & IEEE80211_CAPINFO_ESS) &&
++            !(capabilities & IEEE80211_CAPINFO_IBSS) &&
++            IEEE80211_ADDR_EQ(frame->i_addr2, frame->i_addr3) &&
++            match) {
++            sc->sc_be211_peer_channel = desc->v3.channel;
++            sc->sc_be211_peer_beacon_interval = interval;
++            IEEE80211_ADDR_COPY(sc->sc_be211_peer_bssid, frame->i_addr3);
++        }
++    }
++#ifdef AIRPORT_WCL
++    if (sc->sc_be211_runtime_scan && sc->sc_ic.ic_event_handler) {
++        if (ssid[1] && trailer <= elements_len &&
++            size_t(ssid[1]) + 2 <= elements_len - trailer &&
++            sc->sc_ic.ic_channels[desc->v3.channel].ic_freq) {
++            // The event is consumed synchronously. This node never enters net80211.
++            struct ieee80211_node node = {};
++            IEEE80211_ADDR_COPY(node.ni_bssid, frame->i_addr3);
++            node.ni_chan = &sc->sc_ic.ic_channels[desc->v3.channel];
++            const auto *fixed = ssid - beacon_fixed_len;
++            node.ni_intval = fixed[8] | (fixed[9] << 8);
++            node.ni_capinfo = fixed[10] | (fixed[11] << 8);
++            node.ni_rssi = MIN(sc->sc_ic.ic_max_rssi,
++                MAX(0, iwx_rxmq_get_signal_strength(sc,
++                    const_cast<iwx_rx_mpdu_desc *>(desc)) - IWX_MIN_DBM));
++            node.ni_esslen = ssid[1];
++            memcpy(node.ni_essid, ssid + 2, node.ni_esslen);
++            struct ieee80211_beacon_event event = { &node, ssid, elements_len - trailer,
++                                                    nullptr, 0 };
++            sc->sc_ic.ic_event_handler(&sc->sc_ic, IEEE80211_EVT_BEACON, &event);
++        }
++    }
++#endif
++    for (unsigned index = 0; index < sc->sc_be211_scan_bssid_count; ++index) {
++        if (memcmp(sc->sc_be211_scan_bssids[index], frame->i_addr3, IEEE80211_ADDR_LEN) == 0)
++            return;
++    }
++    if (sc->sc_be211_scan_bssid_count == nitems(sc->sc_be211_scan_bssids)) {
++        sc->sc_be211_scan_bssid_limit = true;
++        return;
++    }
++    memcpy(sc->sc_be211_scan_bssids[sc->sc_be211_scan_bssid_count++],
++           frame->i_addr3, IEEE80211_ADDR_LEN);
++}
++
++void ItlIwx::iwx_be211_auth_response(struct iwx_softc *sc, const iwx_rx_packet *pkt)
++{
++    const size_t payload_length = iwx_rx_packet_payload_len(pkt);
++    if (payload_length < sizeof(iwx_rx_mpdu_desc))
++        return;
++    const auto *desc = reinterpret_cast<const iwx_rx_mpdu_desc *>(pkt->data);
++    const size_t frame_length = le16toh(desc->mpdu_len);
++    const uint32_t good = IWX_RX_MPDU_RES_STATUS_CRC_OK | IWX_RX_MPDU_RES_STATUS_OVERRUN_OK;
++    const unsigned trailer = (desc->mac_flags1 & IWX_RX_MPDU_MFLG1_MIC_CRC_LEN_MASK) >>
++                              IWX_RX_MPDU_MFLG1_MIC_CRC_LEN_SHIFT;
++    const size_t body_offset = sizeof(ieee80211_frame) +
++        ((desc->mac_flags2 & IWX_RX_MPDU_MFLG2_PAD) ? 2 : 0);
++    const unsigned band = (desc->mac_phy_idx & IWX_RX_MPDU_BAND_MASK) >> IWX_RX_MPDU_BAND_POS;
++    if ((le32toh(desc->status) & good) != good ||
++        frame_length > payload_length - sizeof(*desc) ||
++        frame_length < body_offset + 6 + trailer || band != IWX_PHY_BAND_24 ||
++        desc->v3.channel != sc->sc_be211_auth_channel)
++        return;
++    const auto *frame = reinterpret_cast<const ieee80211_frame *>(desc + 1);
++    if (frame->i_fc[0] != sc->sc_be211_mgmt_response_subtype ||
++        (frame->i_fc[1] & (IEEE80211_FC1_DIR_MASK | IEEE80211_FC1_PROTECTED)) ||
++        !IEEE80211_ADDR_EQ(frame->i_addr1, sc->sc_nvm.hw_addr) ||
++        !IEEE80211_ADDR_EQ(frame->i_addr2, sc->sc_be211_auth_bssid) ||
++        !IEEE80211_ADDR_EQ(frame->i_addr3, sc->sc_be211_auth_bssid))
++        return;
++    const auto *body = reinterpret_cast<const uint8_t *>(frame) + body_offset;
++    if (frame->i_fc[0] == IEEE80211_FC0_SUBTYPE_AUTH) {
++        if (body[0] || body[1] || body[2] != 2 || body[3])
++            return;
++        sc->sc_be211_auth_rx_status = body[4] | (body[5] << 8);
++        IOLog("BE211 probe: authentication response transaction=2 status=%u\n",
++              static_cast<unsigned>(sc->sc_be211_auth_rx_status));
++    } else {
++        sc->sc_be211_auth_rx_status = body[2] | (body[3] << 8);
++        sc->sc_be211_assoc_aid = (body[4] | (body[5] << 8)) & 0x3fff;
++        IOLog("BE211 probe: association response status=%u aid=%u\n",
++              static_cast<unsigned>(sc->sc_be211_auth_rx_status),
++              static_cast<unsigned>(sc->sc_be211_assoc_aid));
++    }
++    sc->sc_be211_auth_events |= be211_auth_rx_complete;
++    getMainCommandGate()->commandWakeup(&sc->sc_be211_auth_events);
++}
++
++void ItlIwx::iwx_be211_bsd_input(struct iwx_softc *sc, const iwx_rx_packet *pkt, struct mbuf_list *ml)
++{
++    auto &bridge = *sc->sc_be211_bsd;
++    const size_t payload_length = iwx_rx_packet_payload_len(pkt);
++    if (payload_length < sizeof(iwx_rx_mpdu_desc) || sc->sc_be211_bsd_stop)
++        return;
++    const auto *desc = reinterpret_cast<const iwx_rx_mpdu_desc *>(pkt->data);
++    const size_t frame_length = le16toh(desc->mpdu_len);
++    const uint32_t good = IWX_RX_MPDU_RES_STATUS_CRC_OK | IWX_RX_MPDU_RES_STATUS_OVERRUN_OK;
++    const unsigned trailer = (desc->mac_flags1 & IWX_RX_MPDU_MFLG1_MIC_CRC_LEN_MASK) >>
++                              IWX_RX_MPDU_MFLG1_MIC_CRC_LEN_SHIFT;
++    const unsigned band = (desc->mac_phy_idx & IWX_RX_MPDU_BAND_MASK) >> IWX_RX_MPDU_BAND_POS;
++    if ((le32toh(desc->status) & good) != good ||
++        frame_length > payload_length - sizeof(*desc) ||
++        frame_length < sizeof(ieee80211_frame) + trailer || band != IWX_PHY_BAND_24 ||
++        desc->v3.channel != sc->sc_be211_auth_channel ||
++        (desc->mac_flags2 & IWX_RX_MPDU_MFLG2_AMSDU))
++        return;
++    const auto *frame = reinterpret_cast<const ieee80211_frame *>(desc + 1);
++    const bool qos = frame->i_fc[0] == (IEEE80211_FC0_TYPE_DATA | IEEE80211_FC0_SUBTYPE_QOS);
++    const uint8_t broadcast[] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
++    if ((!qos && frame->i_fc[0] != IEEE80211_FC0_TYPE_DATA) ||
++        (frame->i_fc[1] & (IEEE80211_FC1_DIR_MASK | IEEE80211_FC1_PROTECTED |
++                           IEEE80211_FC1_MORE_FRAG | IEEE80211_FC1_ORDER)) != IEEE80211_FC1_DIR_FROMDS ||
++        (frame->i_seq[0] & 0xf) ||
++        !IEEE80211_ADDR_EQ(frame->i_addr2, sc->sc_be211_auth_bssid) ||
++        (!IEEE80211_ADDR_EQ(frame->i_addr1, sc->sc_nvm.hw_addr) &&
++         !IEEE80211_ADDR_EQ(frame->i_addr1, broadcast)))
++        return;
++    const size_t body_offset = sizeof(*frame) + (qos ? 2 : 0) +
++        ((desc->mac_flags2 & IWX_RX_MPDU_MFLG2_PAD) ? 2 : 0);
++    if (frame_length < trailer + body_offset + be211_snap_size)
++        return;
++    const auto *snap = reinterpret_cast<const uint8_t *>(frame) + body_offset;
++    if (memcmp(snap, be211_snap_prefix, sizeof(be211_snap_prefix)))
++        return;
++    const unsigned protocol = be211_get_be16(snap + sizeof(be211_snap_prefix));
++    const auto *payload = snap + be211_snap_size;
++    const size_t length = frame_length - trailer - body_offset - be211_snap_size;
++    if (length > ETHERMTU)
++        return;
++
++    be211_echo_request *matched_echo = nullptr;
++    const uint8_t *echo = protocol == ETHERTYPE_IP && bridge.ack_forwarded &&
++        IEEE80211_ADDR_EQ(frame->i_addr1, sc->sc_nvm.hw_addr) ?
++        be211_echo_header(payload, length, 0) : nullptr;
++    if (echo) {
++        for (auto &request : bridge.echoes) {
++            if (request.pending && !memcmp(request.addresses, payload + 16, 4) &&
++                !memcmp(request.addresses + 4, payload + 12, 4) &&
++                !memcmp(request.identifier_sequence, echo + 4, sizeof(request.identifier_sequence))) {
++                matched_echo = &request;
++                break;
++            }
++        }
++        if (!matched_echo)
++            return;
++    }
++
++    const unsigned web_port = protocol == ETHERTYPE_IP && bridge.ack_forwarded &&
++        IEEE80211_ADDR_EQ(frame->i_addr1, sc->sc_nvm.hw_addr) ?
++        be211_web_port(payload, length, false, bridge.lease_address) : 0;
++    uint8_t dhcp_type = 0;
++    uint8_t offered_address[4] = {};
++    if (!matched_echo && !web_port) {
++        if (protocol == ETHERTYPE_IP && bridge.xid_valid) {
++            uint32_t xid = 0;
++            dhcp_type = be211_dhcp_type(payload, length, false, sc->sc_nvm.hw_addr, &xid, offered_address);
++            if (xid != bridge.xid ||
++                (dhcp_type != be211_dhcp_offer && dhcp_type != be211_dhcp_ack && dhcp_type != be211_dhcp_nak))
++                return;
++        } else if (protocol != ETHERTYPE_ARP || length < 28) {
++            return;
++        }
++    }
++
++    constexpr unsigned alignment = 2;
++    const size_t ethernet_length = sizeof(ether_header) + length;
++    mbuf_t packet = nullptr;
++    unsigned chunks = 1;
++    if (mbuf_allocpacket(MBUF_DONTWAIT, ethernet_length + alignment, &chunks, &packet))
++        return;
++    auto *data = static_cast<uint8_t *>(mbuf_data(packet)) + alignment;
++    if (mbuf_setdata(packet, data, ethernet_length)) {
++        mbuf_freem(packet);
++        return;
++    }
++    auto *ethernet = reinterpret_cast<ether_header *>(data);
++    IEEE80211_ADDR_COPY(ethernet->ether_dhost, frame->i_addr1);
++    IEEE80211_ADDR_COPY(ethernet->ether_shost, frame->i_addr3);
++    memcpy(&ethernet->ether_type, snap + sizeof(be211_snap_prefix), sizeof(ethernet->ether_type));
++    memcpy(data + sizeof(*ethernet), payload, length);
++    mbuf_pkthdr_setlen(packet, ethernet_length);
++    ml_enqueue(ml, packet);
++
++    ++bridge.rx;
++    if (matched_echo) {
++        matched_echo->pending = false;
++        ++bridge.echo_rx;
++        IOLog("BE211 probe: BSD ICMP RX queued id=%u seq=%u\n",
++              be211_get_be16(echo + 4), be211_get_be16(echo + 6));
++    }
++    if (web_port) {
++        ++bridge.web_rx;
++        if (bridge.web_rx <= be211_web_trace_limit)
++            IOLog("BE211 probe: BSD web RX queued ip_protocol=%u remote_port=%u bytes=%zu\n",
++                  payload[9], web_port, length);
++    }
++    if (dhcp_type == be211_dhcp_ack) {
++        bridge.ack_forwarded = true;
++        memcpy(bridge.lease_address, offered_address, sizeof(bridge.lease_address));
++    } else if (dhcp_type == be211_dhcp_nak) {
++        bzero(bridge.lease_address, sizeof(bridge.lease_address));
++    }
++    if (dhcp_type || bridge.rx <= 8)
++        IOLog("BE211 probe: BSD RX queued protocol=0x%x DHCP type=%u bytes=%zu\n",
++              protocol, dhcp_type, ethernet_length);
++}
++
+ int ItlIwx::
+ iwx_rx_pkt_valid(struct iwx_rx_packet *pkt)
+ {
+@@ -14060,6 +16073,16 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
+         
+         if (!iwx_rx_pkt_valid(pkt))
+             break;
++        if (sc->sc_be211_auth_pending) {
++            const unsigned bytes = iwx_rx_packet_len(pkt);
++            if (code == IWX_REPLY_RX_MPDU_CMD) {
++                ++sc->sc_be211_auth_raw_mpdus;
++            } else if (++sc->sc_be211_auth_raw_notifications <= be211_auth_raw_log_limit) {
++                IOLog("BE211 probe: authentication raw notification group=0x%x cmd=0x%x qid=0x%x index=%u bytes=%u\n",
++                      static_cast<unsigned>(pkt->hdr.group_id), static_cast<unsigned>(pkt->hdr.cmd),
++                      static_cast<unsigned>(qid), static_cast<unsigned>(idx), bytes);
++            }
++        }
+ #ifdef AIRPORT_WCL
+         if (!(qid & 0x80) && qid == IWX_DQA_CMD_QUEUE &&
+             idx < sc->txq[qid].ring_count &&
+@@ -14092,6 +16115,90 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
+         if (len < minsz || len > (IWX_RBUF_SIZE - offset))
+             break;
+         
++        // Keep the scan probe's frames out of net80211.
++        if (sc->sc_be211_bsd_active && code == IWX_REPLY_RX_MPDU_CMD) {
++            iwx_be211_bsd_input(sc, pkt, ml);
++            iwx_be211_count_beacon(sc, pkt);
++            break;
++        }
++        if (sc->sc_be211_bsd_active &&
++            (code == IWX_TX_CMD || code == IWX_WIDE_ID(IWX_LONG_GROUP, IWX_TX_CMD))) {
++            const auto *response = reinterpret_cast<const iwx_tx_resp *>(pkt->data);
++            auto &bridge = *sc->sc_be211_bsd;
++            const auto bytes = iwx_rx_packet_payload_len(pkt);
++            if (bytes >= sizeof(*response) && le16toh(response->tx_queue) == bridge.queue) {
++                uint32_t scheduler_word = 0;
++                unsigned released = 0;
++                if (response->frame_count == 1 && bytes == sizeof(*response) + sizeof(scheduler_word)) {
++                    // The scheduler sequence points just past the reclaimed descriptors.
++                    memcpy(&scheduler_word, pkt->data + sizeof(*response), sizeof(scheduler_word));
++                    released = bridge.ring.complete(static_cast<uint16_t>(le32toh(scheduler_word)));
++                }
++                const unsigned status = le16toh(response->status.status) & IWX_TX_STATUS_MSK;
++                if (released) {
++                    if (bridge.reclaimed < be211_web_trace_limit)
++                        IOLog("BE211 probe: BSD TX completion index=%d status=0x%x retries=%u next=%u released=%u\n",
++                              idx, status, static_cast<unsigned>(response->failure_frame),
++                              static_cast<unsigned>(bridge.ring.read), released);
++                    bridge.reclaimed += released;
++                    if (status != IWX_TX_STATUS_SUCCESS && status != IWX_TX_STATUS_DIRECT_DONE)
++                        ++bridge.failed_completions;
++                    if (bridge.tx_waiting && !sc->sc_be211_bsd_stop) {
++                        bridge.tx_waiting = false;
++                        iwx_add_task(sc, sc->sc_nswq, &sc->start_task);
++                    }
++                } else if (++bridge.invalid_completions <= 4) {
++                    IOLog("BE211 probe: BSD TX completion ignored index=%d bytes=%zu frames=%u next=%u read=%u write=%u\n",
++                          idx, size_t(bytes), static_cast<unsigned>(response->frame_count),
++                          static_cast<unsigned>(static_cast<uint16_t>(le32toh(scheduler_word))),
++                          static_cast<unsigned>(bridge.ring.read), static_cast<unsigned>(bridge.ring.write));
++                }
++            }
++            break;
++        }
++        if (code == IWX_REPLY_RX_MPDU_CMD &&
++            (sc->sc_be211_scan_pending || sc->sc_be211_post_assoc_observing)) {
++            iwx_be211_count_beacon(sc, pkt);
++            break;
++        }
++        if (code == IWX_REPLY_RX_MPDU_CMD && sc->sc_be211_session_pending) {
++            if (sc->sc_be211_auth_pending)
++                iwx_be211_auth_response(sc, pkt);
++            break;
++        }
++        if ((code == IWX_TX_CMD || code == IWX_WIDE_ID(IWX_LONG_GROUP, IWX_TX_CMD)) &&
++            sc->sc_be211_auth_pending) {
++            const auto *response = reinterpret_cast<const iwx_tx_resp *>(pkt->data);
++            const size_t payload_bytes = iwx_rx_packet_payload_len(pkt);
++            if (payload_bytes >= sizeof(*response)) {
++                IOLog("BE211 probe: authentication raw TX frames=%u queue=%u status=0x%x bytes=%zu\n",
++                      static_cast<unsigned>(response->frame_count),
++                      static_cast<unsigned>(le16toh(response->tx_queue)),
++                      static_cast<unsigned>(le16toh(response->status.status)), payload_bytes);
++                if (response->frame_count == 1 && payload_bytes >= sizeof(*response) + sizeof(uint32_t)) {
++                    uint32_t scheduler_word;
++                    memcpy(&scheduler_word, pkt->data + sizeof(*response), sizeof(scheduler_word));
++                    IOLog("BE211 probe: authentication TX scheduler SSN=%u\n",
++                          le32toh(scheduler_word) & 0xfff);
++                }
++            }
++            if (payload_bytes >= sizeof(*response) &&
++                response->frame_count == 1 &&
++                le16toh(response->tx_queue) == sc->sc_be211_auth_queue &&
++                idx == sc->sc_be211_mgmt_index) {
++                sc->sc_be211_auth_tx_status = le16toh(response->status.status) & IWX_TX_STATUS_MSK;
++                sc->sc_be211_auth_events |= be211_auth_tx_complete;
++                const char *phase_name =
++                    sc->sc_be211_mgmt_response_subtype == IEEE80211_FC0_SUBTYPE_AUTH ?
++                    "authentication" : "association";
++                IOLog("BE211 probe: %s TX completion qid=%u index=%d status=0x%x retries=%u\n",
++                      phase_name, static_cast<unsigned>(sc->sc_be211_auth_queue), idx,
++                      static_cast<unsigned>(sc->sc_be211_auth_tx_status),
++                      static_cast<unsigned>(response->failure_frame));
++                getMainCommandGate()->commandWakeup(&sc->sc_be211_auth_events);
++            }
++            break;
++        }
+         if (code == IWX_REPLY_RX_MPDU_CMD && ++nmpdu == 1) {
+             /* Take mbuf m0 off the RX ring. */
+             if (iwx_rx_addbuf(sc, IWX_RBUF_SIZE, (int)(data - sc->rxq.data))) {
+@@ -14159,8 +16266,17 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
+                 uint8_t alive_ver = iwx_lookup_notif_ver(sc, IWX_LEGACY_GROUP, IWX_ALIVE);
+                 size_t alive_len = iwx_rx_packet_payload_len(pkt);
+                 sc->sc_uc.uc_ok = 0;
++                if (sc->sc_be.family == IwxBE::SC &&
++                    (alive_ver != 8 || alive_len != sizeof(struct iwx_alive_resp_v8))) {
++                    IOLog("BE211 probe: unexpected ALIVE version=%u size=%zu\n",
++                          alive_ver, alive_len);
++                    sc->sc_uc.uc_intr = 1;
++                    getMainCommandGate()->commandWakeup(&sc->sc_uc.uc_intr);
++                    break;
++                }
+                 if (alive_len != sizeof(*resp4) && alive_len != sizeof(*resp5) &&
+-                    !((alive_ver == 6 || alive_ver == 7) && alive_len == sizeof(struct iwx_alive_resp_v6))) {
++                    !((alive_ver == 6 || alive_ver == 7) && alive_len == sizeof(struct iwx_alive_resp_v6)) &&
++                    !(alive_ver == 8 && alive_len == sizeof(struct iwx_alive_resp_v8))) {
+                     XYLog("Invalid ALIVE payload: version %u size %zu\n", alive_ver, alive_len);
+                     sc->sc_uc.uc_intr = 1;
+                     getMainCommandGate()->commandWakeup(&sc->sc_uc.uc_intr);
+@@ -14244,6 +16360,7 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
+                 break;
+             }
+                 
++            case IWX_WIDE_ID(IWX_SYSTEM_GROUP, IWX_SHARED_MEM_CFG_CMD):
+             case IWX_WIDE_ID(IWX_REGULATORY_AND_NVM_GROUP,
+                 IWX_NVM_GET_INFO):
+             case IWX_ADD_STA_KEY:
+@@ -14322,7 +16439,17 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
+                 
+             case IWX_SCAN_COMPLETE_UMAC: {
+                 struct iwx_umac_scan_complete *notif;
++                if (iwx_rx_packet_payload_len(pkt) < sizeof(*notif))
++                    break;
+                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_umac_scan_complete *);
++                if (sc->sc_be211_scan_pending && le32toh(notif->uid) == 0) {
++                    sc->sc_be211_scan_status = notif->status;
++                    sc->sc_be211_scan_done = 1;
++                    IOLog("BE211 probe: SCAN_COMPLETE uid=0 status=%u ebs=%u RX notifications=%u\n",
++                          notif->status, notif->ebs_status, sc->sc_be211_scan_frames);
++                    getMainCommandGate()->commandWakeup(&sc->sc_be211_scan_done);
++                    break;
++                }
+                 if (le32toh(notif->uid) == 0)
+                     iwx_endscan(sc, notif->status, true);
+                 break;
+@@ -14331,8 +16458,8 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
+             case IWX_SCAN_ITERATION_COMPLETE_UMAC: {
+                 struct iwx_umac_scan_iter_complete_notif *notif;
+                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_umac_scan_iter_complete_notif *);
+-                if (!sc->sc_use_mld_api && !sc->sc_scan_active &&
+-                    !(sc->sc_flags & IWX_FLAG_SCAN_ABORTING))
++                if (!sc->sc_be211_scan_pending && !sc->sc_use_mld_api &&
++                    !sc->sc_scan_active && !(sc->sc_flags & IWX_FLAG_SCAN_ABORTING))
+                     iwx_endscan(sc, IWX_SCAN_OFFLOAD_COMPLETED, true);
+                 break;
+             }
+@@ -14402,8 +16529,6 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
+             case IWX_WIDE_ID(IWX_SYSTEM_GROUP, IWX_INIT_EXTENDED_CFG_CMD):
+                 break;
+                 
+-            case IWX_WIDE_ID(IWX_SYSTEM_GROUP, IWX_SHARED_MEM_CFG_CMD):
+-                break;
+                 
+             case IWX_WIDE_ID(IWX_REGULATORY_AND_NVM_GROUP,
+                              IWX_NVM_ACCESS_COMPLETE):
+@@ -14521,7 +16646,28 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data, struct mbuf_list *ml)
+                 
+             case IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_SESSION_PROTECTION_NOTIF): {
+                 struct iwx_session_prot_notif *notif;
++                if (iwx_rx_packet_payload_len(pkt) < sizeof(*notif))
++                    break;
+                 SYNC_RESP_STRUCT(notif, pkt, struct iwx_session_prot_notif *);
++                if (isBE211ScanOnly()) {
++                    if (sc->sc_be211_session_pending) {
++                        // Version 3 puts the firmware link ID in mac_id.
++                        const unsigned link = le32toh(notif->mac_id);
++                        const unsigned status = le32toh(notif->status);
++                        const unsigned start = le32toh(notif->start);
++                        const unsigned config = le32toh(notif->conf_id);
++                        IOLog("BE211 probe: session protection notification link=%u config=%u start=%u status=%u\n",
++                              link, config, start, status);
++                        if (link == be211_session_link && config == IWX_SESSION_PROTECT_CONF_ASSOC &&
++                            start <= 1 && status <= 1) {
++                            sc->sc_be211_session_events = be211_session_reported;
++                            if (start == 1 && status == 1)
++                                sc->sc_be211_session_events |= be211_session_active;
++                            getMainCommandGate()->commandWakeup(&sc->sc_be211_session_events);
++                        }
++                    }
++                    break;
++                }
+                 if (!notif->status) {
+                     XYLog("Session protection failure\n");
+                     sc->sc_flags &= ~IWX_FLAG_TE_ACTIVE;
+@@ -15215,6 +17361,7 @@ static const struct pci_matchid iwx_devices[] = {
+     {IWL_PCI_DEVICE(0xa840, PCI_ANY_ID, iwl_bz_trans_cfg)},
+     {IWL_PCI_DEVICE(0x7740, PCI_ANY_ID, iwl_bz_trans_cfg)},
+     {IWL_PCI_DEVICE(0x4d40, PCI_ANY_ID, iwl_bz_trans_cfg)},
++    {IWL_PCI_DEVICE(0xe440, 0x0114, iwl_bz_trans_cfg)},
+ #endif
+     /* Qu devices */
+     {IWL_PCI_DEVICE(0x02F0, PCI_ANY_ID, iwl_qu_trans_cfg)},
+@@ -16253,10 +18400,13 @@ iwx_preinit(struct iwx_softc *sc)
+     
+     /* Configure MAC address. */
+     err = if_setlladdr(ifp, ic->ic_myaddr);
+-    if (err)
++    if (err) {
+         XYLog("%s: could not set MAC address (error %d)\n",
+                 DEVNAME(sc), err);
+-    
++        if (sc->sc_be.family == IwxBE::SC)
++            return err;
++    }
++
+     ieee80211_media_init(ifp);
+     
+     return 0;
+diff --git a/itlwm/hal_iwx/ItlIwx.hpp b/itlwm/hal_iwx/ItlIwx.hpp
+index 5c31615..f36e532 100644
+--- a/itlwm/hal_iwx/ItlIwx.hpp
++++ b/itlwm/hal_iwx/ItlIwx.hpp
+@@ -151,6 +151,15 @@ public:
+     virtual bool attach(IOPCIDevice *device) override;
+     virtual void detach(IOPCIDevice *device) override;
+     IOReturn enable(IONetworkInterface *netif) override;
++    bool isBE211ScanOnly() const { return com.sc_be.family == IwxBE::SC; }
++    bool be211BSDActive() const { return __atomic_load_n(&com.sc_be211_bsd_active, __ATOMIC_ACQUIRE); }
++    bool copyBE211PeerBeacon(void *, size_t) const;
++    bool copyBE211AssociationRates(ieee80211_rateset &) const;
++    bool be211ScanBusy() const { return com.sc_be211_runtime_scan || com.sc_be211_runtime_join; }
++    int scanBE211(uint16_t channels);
++    int probeBE211Join(const uint8_t *, size_t, const uint8_t *,
++                      BE211AssociationObserver = nullptr, void * = nullptr);
++    void cancelBE211Join(const char *source, bool stopping = false);
+     IOReturn disable(IONetworkInterface *netif) override;
+     virtual struct ieee80211com *get80211Controller() override;
+ #ifdef AIRPORT_WCL
+@@ -333,6 +342,19 @@ public:
+     int    iwx_send_phy_cfg_cmd(struct iwx_softc *);
+     int    iwx_load_ucode_wait_alive(struct iwx_softc *);
+     int    iwx_send_dqa_cmd(struct iwx_softc *);
++    int     iwx_be211_shared_mem_probe(struct iwx_softc *);
++    int     iwx_be211_context_probe(struct iwx_softc *, unsigned);
++    int     iwx_be211_mgmt_queue_probe(struct iwx_softc *);
++    int     iwx_be211_dhcp_probe(struct iwx_softc *);
++    bool    iwx_be211_publish_association(struct iwx_softc *);
++    void    iwx_be211_bsd_input(struct iwx_softc *, const iwx_rx_packet *, struct mbuf_list *);
++    void    iwx_be211_bsd_output(struct iwx_softc *);
++    int     iwx_be211_auth_probe(struct iwx_softc *, uint16_t, uint16_t, unsigned,
++                                 iwx_dma_info &, iwx_dma_info &, iwx_dma_info &);
++    void    iwx_be211_auth_response(struct iwx_softc *, const iwx_rx_packet *);
++    int     iwx_be211_mcc_probe(struct iwx_softc *, uint16_t *);
++    int     iwx_be211_passive_scan(struct iwx_softc *, uint16_t);
++    void    iwx_be211_count_beacon(struct iwx_softc *, const struct iwx_rx_packet *);
+     int    iwx_run_init_mvm_ucode(struct iwx_softc *, int);
+     int    iwx_config_ltr(struct iwx_softc *);
+     void    iwx_update_rx_desc(struct iwx_softc *, struct iwx_rx_ring *, int);
+diff --git a/itlwm/hal_iwx/ItlIwxApi86.cpp b/itlwm/hal_iwx/ItlIwxApi86.cpp
+index 43fa05c..55a9fd8 100644
+--- a/itlwm/hal_iwx/ItlIwxApi86.cpp
++++ b/itlwm/hal_iwx/ItlIwxApi86.cpp
+@@ -86,6 +86,81 @@ iwx_umac_scan_v17_fill_general(struct iwx_softc *sc,
+     general_params->passive_dwell[IWX_SCAN_HB_LMAC_IDX] = IWL_SCAN_DWELL_PASSIVE;
+ }
+ 
++// Core 106's v18 request adds one channel slot ahead of the schedule.
++struct iwx_be211_scan_request_v18 {
++    uint32_t uid;
++    uint32_t ooc_priority;
++    struct iwx_api86_scan_general general;
++    uint8_t channel_flags;
++    uint8_t channel_count;
++    uint8_t n_aps_override[2];
++    struct iwx_api86_scan_channel channels[68];
++    struct iwx_scan_periodic_parms_v1 periodic;
++    struct iwx_scan_probe_params_v4 probe;
++} __packed;
++
++static_assert(sizeof(iwx_be211_scan_request_v18) == 1948, "scan v18 request wire size");
++static_assert(offsetof(iwx_be211_scan_request_v18, periodic) == 592, "scan v18 schedule offset");
++
++int ItlIwx::
++iwx_be211_passive_scan(struct iwx_softc *sc, uint16_t channel_mask)
++{
++    unsigned version = iwx_lookup_cmd_ver(sc, IWX_LONG_GROUP, IWX_SCAN_REQ_UMAC);
++    unsigned completion_version = iwx_lookup_notif_ver(sc, IWX_LEGACY_GROUP,
++                                                       IWX_SCAN_COMPLETE_UMAC);
++    IOLog("BE211 probe: SCAN_REQ_UMAC v%u completion v%u 2.4 GHz mask=0x%x\n",
++          version, completion_version, channel_mask);
++    unsigned rx_version = iwx_lookup_notif_ver(sc, IWX_LEGACY_GROUP, IWX_REPLY_RX_MPDU_CMD);
++    IOLog("BE211 probe: RX_MPDU descriptor v%u\n", rx_version);
++    if (version != 18 || completion_version != 1 || rx_version != 8 || !channel_mask)
++        return ENOTSUP;
++    if (sc->sc_flags & IWX_FLAG_RFKILL)
++        return EPERM;
++
++    struct iwx_be211_scan_request_v18 request = {};
++    request.ooc_priority = htole32(IWX_SCAN_PRIORITY_EXT_6);
++    request.general.flags = htole16(IWX_UMAC_SCAN_GEN_FLAGS_V2_FORCE_PASSIVE |
++                                    IWX_UMAC_SCAN_GEN_FLAGS_V2_PASS_ALL);
++    request.general.scan_priority = htole32(IWX_SCAN_PRIORITY_EXT_6);
++    for (unsigned index = 0; index < IWX_SCAN_TWO_LMACS; ++index)
++        request.general.passive_dwell[index] = IWL_SCAN_DWELL_PASSIVE;
++    request.channel_flags = IWX_SCAN_CHANNEL_FLAG_ENABLE_CHAN_ORDER;
++    request.periodic.schedule[0].iter_count = 1;
++
++    // The 2.4 GHz entries at indices 0–10 map to channels 1–11.
++    constexpr unsigned channel_band_shift = 30;
++    for (unsigned index = 0; index < 11; ++index) {
++        if (!(channel_mask & (1U << index)))
++            continue;
++        auto &channel = request.channels[request.channel_count++];
++        channel.flags = htole32(static_cast<uint32_t>(IWX_PHY_BAND_24) << channel_band_shift);
++        channel.channel_num = index + 1;
++        channel.iter_count = 1;
++    }
++    // Force passive and leave the probe template and SSID list empty.
++    sc->sc_be211_scan_done = 0;
++    sc->sc_be211_scan_frames = 0;
++    sc->sc_be211_scan_valid_mpdu = 0;
++    sc->sc_be211_scan_beacons = 0;
++    sc->sc_be211_peer_channel = 0;
++    sc->sc_be211_scan_bssid_count = 0;
++    sc->sc_be211_scan_bssid_limit = false;
++    sc->sc_be211_scan_pending = true;
++    int err = iwx_send_cmd_pdu(sc, IWX_WIDE_ID(IWX_LONG_GROUP, IWX_SCAN_REQ_UMAC),
++                               0, sizeof(request), &request);
++    IOLog("BE211 probe: SCAN_REQ_UMAC v18 passive channels=%u bytes=%zu result=%d\n",
++          request.channel_count, sizeof(request), err);
++    if (!err)
++        err = iwx_wait_notification(sc, &sc->sc_be211_scan_done, 1, 4000);
++    sc->sc_be211_scan_pending = false;
++    IOLog("BE211 probe: scan RX valid MPDUs=%u beacons=%u unique BSSIDs=%u limit reached=%u\n",
++          sc->sc_be211_scan_valid_mpdu, sc->sc_be211_scan_beacons,
++          sc->sc_be211_scan_bssid_count, static_cast<unsigned>(sc->sc_be211_scan_bssid_limit));
++    if (!err && sc->sc_be211_scan_status != IWX_SCAN_OFFLOAD_COMPLETED)
++        return EIO;
++    return err;
++}
++
+ int ItlIwx::
+ iwx_umac_scan_v17(struct iwx_softc *sc, int bgscan)
+ {
+diff --git a/itlwm/hal_iwx/ItlIwxMld.cpp b/itlwm/hal_iwx/ItlIwxMld.cpp
+index 5c34a12..04c56e9 100644
+--- a/itlwm/hal_iwx/ItlIwxMld.cpp
++++ b/itlwm/hal_iwx/ItlIwxMld.cpp
+@@ -1809,7 +1809,17 @@ iwx_mld_queue_cmd(struct iwx_softc *sc, uint32_t sta_mask, int tid, int remove,
+         struct iwx_tx_queue_cfg_rsp *resp = (struct iwx_tx_queue_cfg_rsp *)pkt->data;
+         *qid = le16toh(resp->queue_number);
+         *write_pointer = le16toh(resp->write_pointer);
+-        sc->sc_mld_txq_tidmask |= (1U << tid);
++        if (isBE211ScanOnly()) {
++            // Match Linux's allocation check and retain flags for diagnosis.
++            IOLog("BE211 probe: SCD_QUEUE_CONFIG v3 reply qid=%u flags=0x%x wp=%u reserved=0x%x\n",
++                  static_cast<unsigned>(*qid), static_cast<unsigned>(le16toh(resp->flags)),
++                  static_cast<unsigned>(*write_pointer), static_cast<unsigned>(le16toh(resp->reserved)));
++            if (*qid == IWX_DQA_CMD_QUEUE || *qid >= nitems(sc->txq) ||
++                sc->txq[*qid].desc_dma.vaddr)
++                err = EIO;
++        }
++        if (!err)
++            sc->sc_mld_txq_tidmask |= (1U << tid);
+     }
+     iwx_free_resp(sc, &hcmd);
+     return err;
+diff --git a/itlwm/hal_iwx/if_iwxreg.h b/itlwm/hal_iwx/if_iwxreg.h
+index 3877bdf..8d22f0f 100644
+--- a/itlwm/hal_iwx/if_iwxreg.h
++++ b/itlwm/hal_iwx/if_iwxreg.h
+@@ -1439,7 +1439,7 @@ enum iwx_msix_ivar_for_cause {
+ #define IWX_UCODE_TLV_CAPA_BIGTK_SUPPORT             100
+ #define IWX_UCODE_TLV_CAPA_BIGTK_TX_SUPPORT          109
+ 
+-#define IWX_NUM_UCODE_TLV_CAPA 128
++#define IWX_NUM_UCODE_TLV_CAPA 160
+ 
+ /*
+  * For 16.0 uCode and above, there is no differentiation between sections,
+@@ -1602,6 +1602,7 @@ struct iwx_ucode_header {
+ #define IWX_UCODE_TLV_FW_FSEQ_VERSION    60
+ #define IWX_UCODE_PHY_INTEGRATION_VERSION 61
+ #define IWX_UCODE_TLV_PNVM_VERSION        62
++#define IWX_UCODE_TLV_PNVM_DATA           74
+ #define IWX_UCODE_TLV_PNVM_SKU            64
+ 
+ #define IWX_UCODE_TLV_DEBUG_BASE    0x1000005
+@@ -2358,6 +2359,18 @@ struct iwx_nvm_get_info_rsp {
+     struct iwx_nvm_get_info_regulatory regulatory;
+ } __packed; /* REGULATORY_NVM_GET_INFO_RSP_API_S_VER_4 */
+ 
++// Core 106 uses 32-bit channel profiles and an explicit channel count.
++struct iwx_nvm_get_info_rsp_v5 {
++    struct iwx_nvm_get_info_general general;
++    struct iwx_nvm_get_info_sku mac_sku;
++    struct iwx_nvm_get_info_phy phy_sku;
++    uint32_t lar_enabled;
++    uint32_t n_channels;
++    uint32_t channel_profile[115];
++} __packed;
++static_assert(sizeof(struct iwx_nvm_get_info_rsp_v5) == 488,
++              "NVM_GET_INFO response v5 wire size");
++
+ 
+ #define IWX_ALIVE_STATUS_ERR 0xDEAD
+ #define IWX_ALIVE_STATUS_OK 0xCAFE
+@@ -2417,6 +2430,12 @@ struct iwx_alive_resp_v6 {
+     uint32_t imr_enabled;
+ } __packed;
+ 
++// Core 106 appends a platform ID to the v6/v7 payload.
++struct iwx_alive_resp_v8 {
++    struct iwx_alive_resp_v6 common;
++    uint64_t platform_id;
++} __packed;
++
+ #define IWX_SOC_CONFIG_CMD_FLAGS_DISCRETE    (1 << 0)
+ #define IWX_SOC_CONFIG_CMD_FLAGS_LOW_LATENCY    (1 << 1)
+ 
+diff --git a/itlwm/hal_iwx/if_iwxvar.h b/itlwm/hal_iwx/if_iwxvar.h
+index b5b1293..ae0d5eb 100644
+--- a/itlwm/hal_iwx/if_iwxvar.h
++++ b/itlwm/hal_iwx/if_iwxvar.h
+@@ -228,7 +228,7 @@ struct iwx_tx_radiotap_header {
+ 	 (1 << IEEE80211_RADIOTAP_CHANNEL))
+ 
+ /* BZ FM-92 contains 73 sections, including the CPU and paging separators. */
+-#define IWX_UCODE_SECT_MAX 73
++#define IWX_UCODE_SECT_MAX 75
+ 
+ /*
+  * fw_status is used to determine if we've already parsed the firmware file
+@@ -262,6 +262,8 @@ struct iwx_fw_sects {
+ struct iwx_fw_info {
+ 	void *fw_rawdata;
+ 	size_t fw_rawsize;
++    const uint8_t *embedded_pnvm;
++    size_t embedded_pnvm_size;
+     void *pnvm_rawdata;
+     size_t pnvm_rawsize;
+ 	int fw_status;
+@@ -623,6 +625,11 @@ struct iwx_setkey_arg {
+ 
+ #include "iwx_be_config.h"
+ 
++struct be211_bsd_bridge;
++struct ieee80211_beacon_event;
++
++using BE211AssociationObserver = bool (*)(void *, const ieee80211_beacon_event &);
++
+ struct iwx_softc {
+ 	struct device sc_dev;
+ 	struct ieee80211com sc_ic;
+@@ -754,6 +761,57 @@ struct iwx_softc {
+ #define IWX_INIT_COMPLETE	0x01
+ #define IWX_CALIB_COMPLETE	0x02
+ #define IWX_PNVM_COMPLETE    0x04
++    uint16_t sc_be211_nvm_scan_channels;
++    uint16_t sc_be211_nvm_active_channels;
++    uint16_t sc_be211_mcc_active_channels;
++    uint8_t sc_be211_auth_bssid[IEEE80211_ADDR_LEN];
++    int sc_be211_auth_channel;
++    char sc_be211_auth_ssid[64];
++    unsigned sc_be211_auth_ssid_len;
++    uint8_t sc_be211_assoc_rates[12];
++    unsigned sc_be211_assoc_rate_count;
++    uint16_t sc_be211_assoc_aid;
++    int sc_be211_post_assoc_beacon;
++    bool sc_be211_post_assoc_observing;
++    unsigned sc_be211_mgmt_index;
++    uint8_t sc_be211_mgmt_response_subtype;
++    bool sc_be211_auth_target_configured;
++    bool sc_be211_auth_pending;
++    bool sc_be211_session_pending;
++    int sc_be211_session_events;
++    uint16_t sc_be211_auth_queue;
++    int sc_be211_auth_events;
++    unsigned sc_be211_auth_raw_notifications;
++    unsigned sc_be211_auth_raw_mpdus;
++    uint16_t sc_be211_auth_tx_status;
++    uint16_t sc_be211_auth_rx_status;
++    bool sc_be211_scan_pending;
++    bool sc_be211_runtime_scan;
++    bool sc_be211_runtime_join;
++    bool sc_be211_join_cancelled;
++    bool sc_be211_join_pin_bssid;
++    unsigned sc_be211_join_beacon_logs;
++    int sc_be211_runtime_dhcp_result;
++    struct be211_bsd_bridge *sc_be211_bsd;
++    int sc_be211_bsd_stop;
++    bool sc_be211_bsd_active;
++    BE211AssociationObserver sc_be211_association_observer;
++    void *sc_be211_association_context;
++    uint8_t sc_be211_peer_beacon[0x800];
++    size_t sc_be211_peer_beacon_size;
++    int sc_be211_peer_beacon_rssi;
++    uint16_t sc_be211_requested_channels;
++    int sc_be211_scan_done;
++    uint8_t sc_be211_scan_status;
++    unsigned sc_be211_scan_frames;
++    unsigned sc_be211_scan_valid_mpdu;
++    unsigned sc_be211_scan_beacons;
++    uint8_t sc_be211_peer_channel;
++    uint16_t sc_be211_peer_beacon_interval;
++    uint8_t sc_be211_peer_bssid[IEEE80211_ADDR_LEN];
++    unsigned sc_be211_scan_bssid_count;
++    uint8_t sc_be211_scan_bssids[64][IEEE80211_ADDR_LEN];
++    bool sc_be211_scan_bssid_limit;
+ 
+ 	struct iwx_ucode_status sc_uc;
+ 	char sc_fwver[32];
+diff --git a/itlwm/hal_iwx/iwx_be_config.h b/itlwm/hal_iwx/iwx_be_config.h
+index 4882a6f..002e5b1 100644
+--- a/itlwm/hal_iwx/iwx_be_config.h
++++ b/itlwm/hal_iwx/iwx_be_config.h
+@@ -1,11 +1,12 @@
+ #pragma once
+ 
+ namespace IwxBE {
+-enum Family { None, GL, BZ };
++enum Family { None, GL, BZ, SC };
+ 
+ inline Family pciFamily(unsigned device)
+ {
+     switch (device) {
++    case 0xe440: return SC;
+     case 0x272b: return GL;
+     case 0xa840:
+     case 0x7740:
+@@ -16,6 +17,8 @@ inline Family pciFamily(unsigned device)
+ 
+ inline bool macMatches(Family family, unsigned mac)
+ {
++    if (family == SC)
++        return mac == 0x48; // Panther Lake SC
+     return family == GL ? mac == IWL_CFG_MAC_TYPE_GL :
+         family == BZ && (mac == IWL_CFG_MAC_TYPE_BZ || mac == IWL_CFG_MAC_TYPE_BZ_W);
+ }
