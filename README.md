@@ -64,3 +64,12 @@ Pushing a tag beginning with `v` also creates a draft prerelease containing the 
 The [build notes](source/README.md) point to the complete source archive, the cumulative driver patch and the build script. The driver is based on [AirportItlwm-BE200 FIX31-20261109](https://github.com/Ersiter/AirportItlwm-BE200/releases/tag/FIX31-20261109).
 
 Driver code is distributed under the [GNU GPL v2](LICENSE), with component notices in the corresponding source. Embedded Intel firmware carries its [separate redistribution notice](licenses/LICENCE.iwlwifi_firmware).
+
+## Credits
+
+- [OpenIntelWireless / itlwm](https://github.com/OpenIntelWireless/itlwm) and its contributors for the original Intel wireless driver and AirportItlwm work.
+- [Ersiter / AirportItlwm-BE200](https://github.com/Ersiter/AirportItlwm-BE200), specifically `FIX31-20261109` at `ff82f3e5647ce3885f5d48417b6356a6a23d2163`, for the BE200 transport and Sequoia WCL foundation used by this preview.
+- Intel and the [Linux wireless contributors](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/net/wireless/intel/iwlwifi) for firmware interfaces and reference implementations used during BE211 bring-up. Embedded firmware retains its [Intel redistribution notice](licenses/LICENCE.iwlwifi_firmware). The source archive preserves the original component notices.
+- [Acidanthera / MacKernelSDK](https://github.com/acidanthera/MacKernelSDK), LLVM/Clang and [tpoechtrager / cctools-port](https://github.com/tpoechtrager/cctools-port) for the SDK and Linux cross-build tools.
+
+The local BE211 experiments, hardware testing and documentation are recorded in this repository and [lhl-hackintosh-docs](https://github.com/lems-hardware/lhl-hackintosh-docs).
