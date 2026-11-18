@@ -50,10 +50,16 @@ def imports(path):
 
 expected_imports = imports(baseline / "Contents/MacOS/AirportItlwm")
 actual_imports = imports(binary)
-if actual_imports != expected_imports:
+# These compiler-selected alternatives are exported by Sequoia libkern.
+# https://github.com/apple-oss-distributions/xnu/blob/xnu-11417.140.69/config/Libkern.exports
+compiler_imports = {"__ZdlPv": "__ZdlPvm", "_strlcpy": "___strlcpy_chk"}
+def normalize_imports(symbols):
+    return {compiler_imports.get(symbol, symbol) for symbol in symbols}
+
+if normalize_imports(actual_imports) != normalize_imports(expected_imports):
     print("Added imports:", sorted(actual_imports - expected_imports), flush=True)
     print("Removed imports:", sorted(expected_imports - actual_imports), flush=True)
-    raise SystemExit("Undefined imports differ from the tested preview")
+    raise SystemExit("Unexpected undefined imports differ from the tested preview")
 for marker in (b"_BE211_OPEN_NETWORKS_1", b"duration=until-disconnect", b"BSD TX ring tx="):
     if marker not in data:
         raise SystemExit(f"Missing driver marker {marker!r}")
@@ -63,6 +69,8 @@ record = {
     "compiler": run("clang++", "--version"),
     "linker": "cctools-port 9fc3e04656050ddc33d24c036ab822249af4ceee, ld64-711",
     "binary_sha256": sha256(binary),
+    "added_imports": sorted(actual_imports - expected_imports),
+    "removed_imports": sorted(expected_imports - actual_imports),
     "matches_tested_binary": data == (baseline / "Contents/MacOS/AirportItlwm").read_bytes(),
     "validation": "Mach-O, Info.plist, imports and build markers passed",
     "hardware_test": "CI build has not been tested on hardware",
