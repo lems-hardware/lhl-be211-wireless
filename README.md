@@ -51,6 +51,14 @@ Boot the test EFI and choose a visible open 2.4 GHz network in the Wi-Fi menu. T
 
 The optional [Safari collector](tools/capture-safari.sh) is for the Framework test setup. It expects `en0` and a mounted `FILES` volume with a `wifi-logs` directory. It records local IP state, DNS and TCP metadata. Review the capture for network names and addresses before sharing it.
 
+## Automated Builds
+
+GitHub Actions builds the source snapshot on pushes to `main`, pull requests and manual runs. The workflow checks the archived files, compiles the driver, validates its bundle and imports, and uploads a kext ZIP with matching source, checksums and `build-info.json`. Download these from the run's Artifacts section. [Build workflow](.github/workflows/build.yml)
+
+CI uses Ubuntu 24.04, Clang 18 and a pinned ld64-711 source revision. The published Attempt 101 executable was built with Clang 23.1.4. Each CI artifact records its own compiler, commit and digest. Hardware testing is recorded separately from successful compilation.
+
+Pushing a tag beginning with `v` also creates a draft prerelease containing the validated artifacts. Review the draft and hardware results before publishing it.
+
 ## Source and License
 
 The [build notes](source/README.md) point to the complete source archive, the cumulative driver patch and the build script. The driver is based on [AirportItlwm-BE200 FIX31-20261109](https://github.com/Ersiter/AirportItlwm-BE200/releases/tag/FIX31-20261109).
