@@ -35,6 +35,8 @@ The full platform investigation and earlier boot history are in [lhl-hackintosh-
 
 Platform follow-up through Attempt 109 reused this same Wi-Fi executable while bringing up onboard audio, the tested external USB mouse path and battery/charger reporting. The latest USB reconnect tests and battery charger-transition capture reported the retained functions working. These tests add no new evidence for secured networks, other bands or sleep-state support. See the [USB and battery evidence summary](https://github.com/lems-hardware/lhl-hackintosh-docs/blob/main/logs/usb-power-evidence.md).
 
+Graphics follow-up through Attempt 118 retained the exact published Attempt 101 Wi-Fi executable. I verified its SHA-256 against the graphics test EFIs. The new results concern xe core loading, metadata checks and PCI bus setup, with no new wireless capability or dedicated Wi-Fi qualification. See the [graphics evidence summary](https://github.com/lems-hardware/lhl-hackintosh-docs/blob/main/logs/graphics-evidence.md).
+
 ## Developer Preview
 
 Download [AirportItlwm-BE211-attempt-101.zip](kexts/AirportItlwm-BE211-attempt-101.zip) or browse the [kext bundle](kexts/AirportItlwm.kext). This is the exact Attempt 101 executable and Info.plist. Use [SHA256SUMS](SHA256SUMS) to verify the files.
